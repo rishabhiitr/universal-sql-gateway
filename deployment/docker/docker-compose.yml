@@ -8,6 +8,7 @@ services:
       - HTTP_ADDR=:8080
       - JWT_SECRET=dev-secret
       - POLICY_PATH=/configs/policy.yaml
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
     ports:
       - "8080:8080"
     depends_on:

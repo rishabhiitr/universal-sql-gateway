@@ -8,11 +8,14 @@ import (
 	"strconv"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.uber.org/zap"
 
 	"github.com/rishabhm/universal-sql-query-layer/internal/models"
 	qerrors "github.com/rishabhm/universal-sql-query-layer/pkg/errors"
 	"github.com/rishabhm/universal-sql-query-layer/pkg/middleware"
+	"github.com/rishabhm/universal-sql-query-layer/pkg/tracing"
 )
 
 type parser interface {
@@ -42,8 +45,14 @@ func (h *Handler) Healthz(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (h *Handler) Query(w http.ResponseWriter, r *http.Request) {
+	tracer := otel.Tracer(tracing.ServiceName)
+	ctx, span := tracer.Start(r.Context(), "gateway.query")
+	defer span.End()
+
 	traceID := uuid.NewString()
-	principal, ok := middleware.PrincipalFromContext(r.Context())
+	span.SetAttributes(attribute.String("query.trace_id", traceID))
+
+	principal, ok := middleware.PrincipalFromContext(ctx)
 	if !ok {
 		writeJSON(w, http.StatusUnauthorized, map[string]any{
 			"code":     "UNAUTHORIZED",
@@ -63,6 +72,11 @@ func (h *Handler) Query(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	span.SetAttributes(
+		attribute.String("query.sql", req.SQL),
+		attribute.String("tenant.id", principal.TenantID),
+	)
+
 	plan, err := h.parser.ParseSQL(req.SQL)
 	if err != nil {
 		h.writeError(w, err, traceID)
@@ -70,8 +84,9 @@ func (h *Handler) Query(w http.ResponseWriter, r *http.Request) {
 	}
 	plan.MaxStalenessMS = req.MaxStalenessMS
 
-	resp, err := h.executor.Execute(r.Context(), principal, plan, req)
+	resp, err := h.executor.Execute(ctx, principal, plan, req)
 	if err != nil {
+		span.RecordError(err)
 		h.writeError(w, err, traceID)
 		return
 	}

@@ -3,162 +3,167 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Universal SQL Query UI</title>
+  <title>Universal SQL Query Layer Demo</title>
   <style>
-    :root {
-      color-scheme: light dark;
-      font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    :root { font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #0b1020; color: #e5e7eb; }
+    .container { max-width: 1200px; margin: 20px auto; padding: 0 16px; }
+    .card { background: #121a31; border: 1px solid #22305f; border-radius: 12px; padding: 14px; margin-bottom: 12px; }
+    h1 { margin: 0; font-size: 1.35rem; }
+    .banner { color: #93c5fd; font-size: 0.9rem; margin-top: 6px; }
+    .scenario-group { margin-top: 12px; }
+    .scenario-group-title { font-size: 0.75rem; text-transform: uppercase; color: #94a3b8; margin: 4px 0; }
+    .buttons { display: flex; flex-wrap: wrap; gap: 8px; padding-bottom: 8px; border-bottom: 1px solid #243463; }
+    .buttons:last-child { border-bottom: 0; padding-bottom: 0; }
+    .scenario-btn, .run-btn {
+      border: 1px solid #31529f; border-radius: 8px; background: #18254a; color: #dbeafe;
+      padding: 8px 10px; cursor: pointer; font-size: 0.9rem;
     }
-    body {
-      margin: 0;
-      background: #0b1020;
-      color: #e5e7eb;
-    }
-    .container {
-      max-width: 1000px;
-      margin: 24px auto;
-      padding: 0 16px;
-    }
-    .card {
-      background: #121a31;
-      border: 1px solid #22305f;
-      border-radius: 10px;
-      padding: 16px;
-      margin-bottom: 16px;
-    }
-    h1 {
-      margin: 0 0 8px;
-      font-size: 1.4rem;
-    }
-    .muted {
-      color: #9ca3af;
-      margin: 0 0 10px;
-      font-size: 0.9rem;
-    }
-    label {
-      display: block;
-      margin-top: 10px;
-      margin-bottom: 6px;
-      font-weight: 600;
-    }
-    input, textarea, button {
-      width: 100%;
-      box-sizing: border-box;
-      border-radius: 8px;
-      border: 1px solid #31457f;
-      background: #0d1530;
-      color: #e5e7eb;
-      padding: 10px;
+    .scenario-btn.active { background: #2850a3; border-color: #60a5fa; }
+    .run-btn { width: 100%; margin-top: 10px; background: #2563eb; border: 0; font-weight: 700; }
+    .run-btn:disabled { opacity: 0.6; cursor: wait; }
+    .layout { display: grid; grid-template-columns: 1.1fr 1fr; gap: 12px; }
+    @media (max-width: 980px) { .layout { grid-template-columns: 1fr; } }
+    label { display: block; margin-top: 8px; margin-bottom: 6px; font-weight: 600; }
+    input, textarea, pre {
+      width: 100%; border-radius: 8px; border: 1px solid #31457f; background: #0d1530; color: #e5e7eb; padding: 10px;
       font: inherit;
     }
-    textarea {
-      min-height: 130px;
-      resize: vertical;
-      line-height: 1.4;
-    }
-    .grid {
-      display: grid;
-      gap: 12px;
-      grid-template-columns: 2fr 1fr;
-    }
-    @media (max-width: 768px) {
-      .grid {
-        grid-template-columns: 1fr;
-      }
-    }
-    .btn {
-      cursor: pointer;
-      border: none;
-      background: #3b82f6;
-      font-weight: 700;
-      margin-top: 12px;
-    }
-    .btn:disabled {
-      opacity: 0.6;
-      cursor: wait;
-    }
-    .status {
-      margin: 0;
-      font-size: 0.92rem;
-      color: #cbd5e1;
-    }
-    .mono {
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    }
-    .table-wrap {
-      overflow: auto;
-      border: 1px solid #31457f;
-      border-radius: 8px;
-    }
-    table {
-      border-collapse: collapse;
-      width: 100%;
-      min-width: 560px;
-    }
-    th, td {
-      padding: 8px 10px;
-      border-bottom: 1px solid #22305f;
-      text-align: left;
-      font-size: 0.9rem;
-      vertical-align: top;
-    }
-    pre {
-      margin: 0;
-      padding: 12px;
-      border-radius: 8px;
-      background: #0d1530;
-      border: 1px solid #31457f;
-      overflow: auto;
-    }
+    textarea { min-height: 190px; resize: vertical; line-height: 1.35; }
+    .readonly { opacity: 0.9; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .meta-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+    .chip { font-size: 0.8rem; border-radius: 999px; border: 1px solid #334155; padding: 4px 9px; background: #111827; }
+    .chip.good { border-color: #166534; color: #bbf7d0; background: #052e16; }
+    .chip.bad { border-color: #991b1b; color: #fecaca; background: #450a0a; }
+    .chip.warn { border-color: #92400e; color: #fde68a; background: #451a03; }
+    .muted { color: #94a3b8; margin: 0; font-size: 0.9rem; }
+    .table-wrap { overflow: auto; border: 1px solid #31457f; border-radius: 8px; max-height: 420px; }
+    table { width: 100%; min-width: 700px; border-collapse: collapse; }
+    th, td { border-bottom: 1px solid #22305f; padding: 8px 10px; text-align: left; font-size: 0.88rem; vertical-align: top; }
+    tbody tr:nth-child(odd) { background: #101a37; }
+    td.redacted { background: #78350f; color: #fde68a; font-weight: 600; }
+    .error-card { border: 1px solid #b91c1c; background: #3f0f12; border-radius: 8px; padding: 10px; color: #fecaca; }
+    .split { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    @media (max-width: 980px) { .split { grid-template-columns: 1fr; } }
+    .section-title { font-size: 0.92rem; color: #bfdbfe; margin: 0 0 6px; }
+    .request-response { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    @media (max-width: 980px) { .request-response { grid-template-columns: 1fr; } }
+    .burst-grid { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    .badge { font-size: 0.78rem; border-radius: 999px; padding: 3px 8px; border: 1px solid; }
+    .badge.ok { border-color: #166534; background: #052e16; color: #bbf7d0; }
+    .badge.err { border-color: #991b1b; background: #450a0a; color: #fecaca; }
+    .request-cards { margin-top: 10px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    @media (max-width: 980px) { .request-cards { grid-template-columns: 1fr; } }
+    .request-card { border: 1px solid #334155; border-radius: 8px; padding: 8px; background: #0c142b; }
+    .request-card.ok { border-color: #166534; }
+    .request-card.err { border-color: #991b1b; }
+    .request-card-title { margin: 0 0 6px; color: #bfdbfe; font-size: 0.85rem; }
+    .request-card-line { margin: 2px 0; font-size: 0.8rem; color: #cbd5e1; word-break: break-word; }
+    details { border: 1px solid #2a3a6e; border-radius: 8px; background: #0e1630; padding: 8px; }
+    summary { cursor: pointer; color: #cbd5e1; margin-bottom: 8px; }
   </style>
 </head>
 <body>
   <div class="container">
     <div class="card">
-      <h1>Universal SQL Query UI</h1>
-      <p class="muted">Run SQL against <span class="mono">/v1/query</span> with a bearer token.</p>
-      <div class="grid">
-        <div>
-          <label for="token">Bearer token (JWT)</label>
-          <input id="token" placeholder="Paste JWT token here" />
-        </div>
-        <div>
-          <label for="staleness">max_staleness_ms</label>
-          <input id="staleness" type="number" min="0" value="60000" />
-        </div>
+      <h1>Universal SQL Query Layer</h1>
+      <p class="banner">Interactive evaluator demo: auth, RLS/CLS, cache/freshness, rate limits, and source pushdown.</p>
+      <div class="scenario-group">
+        <div class="scenario-group-title">Security</div>
+        <div class="buttons" id="securityButtons"></div>
       </div>
-      <label for="sql">SQL</label>
-      <textarea id="sql" class="mono">SELECT gh.title, gh.state, j.issue_key, j.status, j.assignee
-FROM github.pull_requests gh
-JOIN jira.issues j ON gh.jira_issue_id = j.issue_key
-WHERE gh.state = 'open'
-LIMIT 10</textarea>
-      <button id="run" class="btn">Run Query</button>
+      <div class="scenario-group">
+        <div class="scenario-group-title">Freshness</div>
+        <div class="buttons" id="freshnessButtons"></div>
+      </div>
+      <div class="scenario-group">
+        <div class="scenario-group-title">System</div>
+        <div class="buttons" id="systemButtons"></div>
+      </div>
+    </div>
+
+    <div class="layout">
+      <div class="card">
+        <label for="sql">SQL Editor</label>
+        <textarea id="sql" class="mono"></textarea>
+        <label for="staleness">max_staleness_ms</label>
+        <input id="staleness" type="number" min="0" value="0" />
+        <label for="token">Token (readonly)</label>
+        <input id="token" class="mono readonly" readonly />
+        <button id="run" class="run-btn">Run Query -></button>
+      </div>
+      <div class="card">
+        <p id="scenarioTitle" class="section-title">What this shows</p>
+        <p id="scenarioDesc" class="muted">Select a scenario button to auto-populate query and token.</p>
+        <div class="meta-row" id="metaBar"></div>
+        <p id="extraNote" class="muted" style="margin-top:10px;"></p>
+      </div>
+    </div>
+
+    <div class="card" id="resultsCard">
+      <p class="section-title">Results</p>
+      <div id="resultsBody">
+        <p class="muted">Run a scenario to see rows or an actionable error.</p>
+      </div>
     </div>
 
     <div class="card">
-      <p id="status" class="status">Ready.</p>
-      <div id="tableWrap" class="table-wrap" style="display:none;"></div>
-    </div>
-
-    <div class="card">
-      <label>Raw response</label>
-      <pre id="raw" class="mono">{}</pre>
+      <details open>
+        <summary>Request Details (always visible)</summary>
+        <div class="request-response">
+          <div>
+            <p class="section-title">Request</p>
+            <pre id="requestRaw" class="mono">{}</pre>
+          </div>
+          <div>
+            <p class="section-title">Response</p>
+            <pre id="responseRaw" class="mono">{}</pre>
+          </div>
+        </div>
+        <div id="burstInspector"></div>
+      </details>
     </div>
   </div>
 
   <script>
-    const tokenEl = document.getElementById("token");
-    const stalenessEl = document.getElementById("staleness");
-    const sqlEl = document.getElementById("sql");
-    const runBtn = document.getElementById("run");
-    const statusEl = document.getElementById("status");
-    const rawEl = document.getElementById("raw");
-    const tableWrapEl = document.getElementById("tableWrap");
+    const TOKENS = {
+      alice: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJlbWFpbCI6ImFsaWNlQGFjbWUuZGV2IiwiZXhwIjoyMDg3OTcwNDU0LCJpYXQiOjE3NzI2MTA0NTQsInJvbGVzIjpbImFkbWluIl0sInN1YiI6InUtMSIsInRlbmFudF9pZCI6InQtMSIsInVzZXJuYW1lIjoiYWxpY2UifQ._pZSXapiFA1paGf4cfzoz4gqd6hN2GTEDBMPdz1fbwg",
+      bob: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJlbWFpbCI6ImJvYkBhY21lLmRldiIsImV4cCI6MjA4Nzk3MDQ1NCwiaWF0IjoxNzcyNjEwNDU0LCJyb2xlcyI6WyJkZXZlbG9wZXIiXSwic3ViIjoidS0yIiwidGVuYW50X2lkIjoidC0xIiwidXNlcm5hbWUiOiJib2IifQ.h76c0L8yJwCGjycsyVAFdeMjAEdfx8IrrWJtnV7Z2wI",
+      charlie: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJlbWFpbCI6ImNoYXJsaWVAYWNtZS5kZXYiLCJleHAiOjIwODc5NzA0NTQsImlhdCI6MTc3MjYxMDQ1NCwicm9sZXMiOlsidmlld2VyIl0sInN1YiI6InUtMyIsInRlbmFudF9pZCI6InQtMSIsInVzZXJuYW1lIjoiY2hhcmxpZSJ9.1pPcjpU2CaBf3L8lM0QigDOgP_GK6KzsBt6tY33iczk"
+    };
 
-    function setStatus(message) {
-      statusEl.textContent = message;
-    }
+    const SQL = {
+      join: "SELECT gh.pr_number, gh.title, gh.author, gh.email, j.issue_key, j.assignee, j.assignee_email, j.status\nFROM github.pull_requests gh\nJOIN jira.issues j ON gh.jira_issue_id = j.issue_key\nWHERE gh.state = 'open'\nLIMIT 12",
+      githubOnly: "SELECT gh.pr_number, gh.title, gh.author, gh.email, gh.state\nFROM github.pull_requests gh\nWHERE gh.state = 'open'\nLIMIT 12"
+    };
+
+    const SCENARIOS = [
+      { id: "cross_join", group: "securityButtons", label: "Cross-app JOIN", token: "alice", staleness: 0, sql: SQL.join, desc: "GitHub PRs join Jira issues. Admin user sees all rows.", run: "single" },
+      { id: "rls", group: "securityButtons", label: "RLS (developer)", token: "bob", staleness: 0, sql: SQL.join, desc: "Same SQL with developer role. Row-level filters restrict to bob-owned records.", run: "single" },
+      { id: "cls", group: "securityButtons", label: "CLS (masked email)", token: "charlie", staleness: 0, sql: SQL.join, desc: "Viewer role has column masking on email fields, highlighted in amber.", run: "single" },
+      { id: "cache_hit", group: "freshnessButtons", label: "Cache hit", token: "alice", staleness: 60000, sql: SQL.join, desc: "Auto-runs twice with 500ms gap. First should miss cache, second should hit.", run: "double" },
+      { id: "stale_cached", group: "freshnessButtons", label: "Staleness (cached)", token: "alice", staleness: 60000, sql: SQL.join, desc: "Allows staleness so cached response can be served.", note: "Data is mocked. cache_hit and freshness_ms prove real cache behavior.", run: "single" },
+      { id: "force_live", group: "freshnessButtons", label: "Staleness (force live)", token: "alice", staleness: 0, sql: SQL.join, desc: "max_staleness_ms=0 forces live connector fetch.", note: "Data is mocked. cache_hit and freshness_ms prove real cache behavior.", run: "single" },
+      { id: "burst", group: "systemButtons", label: "Rate limit burst", token: "alice", staleness: 0, sql: SQL.join, desc: "Sends 20 parallel requests. With github burst=4, several should return RATE_LIMIT_EXHAUSTED.", run: "burst" },
+      { id: "github_only", group: "systemButtons", label: "GitHub-only query", token: "alice", staleness: 0, sql: SQL.githubOnly, desc: "Single-source query: sources should only include github due to pushdown.", run: "single" }
+    ];
+
+    const sqlEl = document.getElementById("sql");
+    const stalenessEl = document.getElementById("staleness");
+    const tokenEl = document.getElementById("token");
+    const runBtn = document.getElementById("run");
+    const scenarioTitleEl = document.getElementById("scenarioTitle");
+    const scenarioDescEl = document.getElementById("scenarioDesc");
+    const metaBarEl = document.getElementById("metaBar");
+    const resultsBodyEl = document.getElementById("resultsBody");
+    const requestRawEl = document.getElementById("requestRaw");
+    const responseRawEl = document.getElementById("responseRaw");
+    const burstInspectorEl = document.getElementById("burstInspector");
+    const extraNoteEl = document.getElementById("extraNote");
+
+    let activeScenario = null;
 
     function escapeHTML(value) {
       return String(value)
@@ -169,74 +174,245 @@ LIMIT 10</textarea>
         .replaceAll("'", "&#039;");
     }
 
-    function renderTable(data) {
-      const columns = Array.isArray(data?.columns) ? data.columns : [];
-      const rows = Array.isArray(data?.rows) ? data.rows : [];
-
-      if (columns.length === 0 || rows.length === 0) {
-        tableWrapEl.style.display = "none";
-        tableWrapEl.innerHTML = "";
-        return;
-      }
-
-      const header = columns.map((col) => `<th>${escapeHTML(col.name || "")}</th>`).join("");
-      const body = rows.map((row) => {
-        const cells = columns.map((col) => `<td>${escapeHTML(row?.[col.name] ?? "")}</td>`).join("");
-        return `<tr>${cells}</tr>`;
-      }).join("");
-
-      tableWrapEl.innerHTML = `<table><thead><tr>${header}</tr></thead><tbody>${body}</tbody></table>`;
-      tableWrapEl.style.display = "block";
+    function tokenPreview(token) {
+      if (!token || token.startsWith("PASTE_")) return "missing-token";
+      if (token.length < 18) return token;
+      return token.slice(0, 8) + "..." + token.slice(-8);
     }
 
-    async function runQuery() {
+    function renderScenarioButtons() {
+      SCENARIOS.forEach((scenario) => {
+        const host = document.getElementById(scenario.group);
+        const btn = document.createElement("button");
+        btn.className = "scenario-btn";
+        btn.id = "btn-" + scenario.id;
+        btn.textContent = scenario.label;
+        btn.addEventListener("click", () => selectScenario(scenario.id));
+        host.appendChild(btn);
+      });
+    }
+
+    function selectScenario(scenarioID) {
+      activeScenario = SCENARIOS.find((s) => s.id === scenarioID);
+      if (!activeScenario) return;
+      document.querySelectorAll(".scenario-btn").forEach((btn) => btn.classList.remove("active"));
+      const activeBtn = document.getElementById("btn-" + activeScenario.id);
+      if (activeBtn) activeBtn.classList.add("active");
+
+      const token = TOKENS[activeScenario.token] || "";
+      tokenEl.value = token;
+      sqlEl.value = activeScenario.sql;
+      stalenessEl.value = String(activeScenario.staleness);
+      scenarioTitleEl.textContent = "What this shows: " + activeScenario.label;
+      scenarioDescEl.textContent = activeScenario.desc;
+      extraNoteEl.textContent = activeScenario.note || "";
+      resultsBodyEl.innerHTML = "<p class='muted'>Ready. Click Run Query.</p>";
+      metaBarEl.innerHTML = "";
+      requestRawEl.textContent = "{}";
+      responseRawEl.textContent = "{}";
+      burstInspectorEl.innerHTML = "";
+    }
+
+    function renderTable(payload) {
+      const cols = Array.isArray(payload?.columns) ? payload.columns : [];
+      const rows = Array.isArray(payload?.rows) ? payload.rows : [];
+      if (!cols.length) {
+        return "<p class='muted'>No rows returned.</p>";
+      }
+      const header = cols.map((c) => "<th>" + escapeHTML(c.name || "") + "</th>").join("");
+      const body = rows.map((row) => {
+        const cells = cols.map((c) => {
+          const val = row?.[c.name];
+          const raw = val == null ? "" : String(val);
+          const isRedacted = raw === "[REDACTED]";
+          const klass = isRedacted ? " class='redacted'" : "";
+          return "<td" + klass + ">" + escapeHTML(raw) + "</td>";
+        }).join("");
+        return "<tr>" + cells + "</tr>";
+      }).join("");
+      return "<div class='table-wrap'><table><thead><tr>" + header + "</tr></thead><tbody>" + body + "</tbody></table></div>";
+    }
+
+    function renderError(payload) {
+      const code = payload?.code || "UNKNOWN_ERROR";
+      const message = payload?.message || "Request failed.";
+      const retryAfter = payload?.retry_after || payload?.retry_after_s || "n/a";
+      return "<div class='error-card'><div><strong>code:</strong> " + escapeHTML(code) + "</div><div><strong>message:</strong> " + escapeHTML(message) + "</div><div><strong>retry_after:</strong> " + escapeHTML(retryAfter) + "</div></div>";
+    }
+
+    function metaChip(label, style) {
+      return "<span class='chip " + (style || "") + "'>" + escapeHTML(label) + "</span>";
+    }
+
+    function renderMetadata(payload, status, latencyMs) {
+      const chips = [];
+      chips.push(metaChip("HTTP " + status, status >= 400 ? "bad" : "good"));
+      chips.push(metaChip("latency " + latencyMs + "ms"));
+      chips.push(metaChip("trace_id " + (payload?.trace_id || "n/a")));
+      if (typeof payload?.freshness_ms === "number") {
+        chips.push(metaChip("freshness_ms " + payload.freshness_ms, payload.freshness_ms > 0 ? "warn" : "good"));
+      }
+      if (typeof payload?.cache_hit === "boolean") {
+        chips.push(metaChip("cache_hit " + payload.cache_hit, payload.cache_hit ? "good" : "warn"));
+      }
+      const rl = Array.isArray(payload?.rate_limit_status) ? payload.rate_limit_status : [];
+      rl.forEach((item) => {
+        const suffix = item.allowed ? "OK" : "RL";
+        chips.push(metaChip(item.connector_id + " " + suffix, item.allowed ? "good" : "bad"));
+      });
+      metaBarEl.innerHTML = chips.join("");
+    }
+
+    async function executeRequest(token, sql, maxStaleness) {
+      const body = { sql: sql, max_staleness_ms: maxStaleness };
+      const started = Date.now();
+      const response = await fetch("/v1/query", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
+        body: JSON.stringify(body)
+      });
+      const payload = await response.json().catch(() => ({}));
+      const latency = Date.now() - started;
+      return { response, payload, latency, requestBody: body };
+    }
+
+    async function runSingle() {
       const token = tokenEl.value.trim();
       const sql = sqlEl.value.trim();
       const maxStaleness = Number(stalenessEl.value || 0);
-
-      if (!token) {
-        setStatus("Token is required.");
+      if (!token || token.startsWith("PASTE_")) {
+        resultsBodyEl.innerHTML = "<div class='error-card'>Missing JWT token. Generate tokens via cmd/token-gen and paste into TOKENS.</div>";
         return;
       }
-      if (!sql) {
-        setStatus("SQL is required.");
-        return;
-      }
-
       runBtn.disabled = true;
-      setStatus("Running query...");
-
-      const startedAt = performance.now();
+      burstInspectorEl.innerHTML = "";
       try {
-        const response = await fetch("/v1/query", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${token}`
-          },
-          body: JSON.stringify({
-            sql,
-            max_staleness_ms: Number.isFinite(maxStaleness) ? maxStaleness : 0
-          })
-        });
-
-        const payload = await response.json().catch(() => ({}));
-        const elapsed = Math.round(performance.now() - startedAt);
-        const traceId = payload?.trace_id ? ` trace_id=${payload.trace_id}` : "";
-        setStatus(`HTTP ${response.status} in ${elapsed}ms.${traceId}`);
-        rawEl.textContent = JSON.stringify(payload, null, 2);
-        renderTable(payload);
-      } catch (error) {
-        setStatus("Request failed. Check gateway logs.");
-        rawEl.textContent = JSON.stringify({ error: String(error) }, null, 2);
-        tableWrapEl.style.display = "none";
-        tableWrapEl.innerHTML = "";
+        const { response, payload, latency, requestBody } = await executeRequest(token, sql, maxStaleness);
+        requestRawEl.textContent = JSON.stringify({
+          endpoint: "POST /v1/query",
+          authorization: "Bearer " + tokenPreview(token),
+          body: requestBody
+        }, null, 2);
+        responseRawEl.textContent = JSON.stringify({ status: response.status, latency_ms: latency, body: payload }, null, 2);
+        renderMetadata(payload, response.status, latency);
+        resultsBodyEl.innerHTML = response.status >= 400 ? renderError(payload) : renderTable(payload);
+      } catch (err) {
+        resultsBodyEl.innerHTML = "<div class='error-card'>Request failed: " + escapeHTML(String(err)) + "</div>";
       } finally {
         runBtn.disabled = false;
       }
     }
 
-    runBtn.addEventListener("click", runQuery);
+    async function runDoubleCache() {
+      const token = tokenEl.value.trim();
+      const sql = sqlEl.value.trim();
+      const maxStaleness = Number(stalenessEl.value || 0);
+      runBtn.disabled = true;
+      burstInspectorEl.innerHTML = "";
+      try {
+        const first = await executeRequest(token, sql, maxStaleness);
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        const second = await executeRequest(token, sql, maxStaleness);
+        requestRawEl.textContent = JSON.stringify({
+          endpoint: "POST /v1/query x2",
+          authorization: "Bearer " + tokenPreview(token),
+          body: { sql: sql, max_staleness_ms: maxStaleness }
+        }, null, 2);
+        responseRawEl.textContent = JSON.stringify({
+          request_1: { status: first.response.status, latency_ms: first.latency, body: first.payload },
+          request_2: { status: second.response.status, latency_ms: second.latency, body: second.payload }
+        }, null, 2);
+        renderMetadata(second.payload, second.response.status, second.latency);
+
+        const left = first.response.status >= 400 ? renderError(first.payload) : renderTable(first.payload);
+        const right = second.response.status >= 400 ? renderError(second.payload) : renderTable(second.payload);
+        resultsBodyEl.innerHTML =
+          "<div class='split'>" +
+          "<div><p class='section-title'>Request 1 (expected miss)</p>" + left + "</div>" +
+          "<div><p class='section-title'>Request 2 (expected hit)</p>" + right + "</div>" +
+          "</div>";
+      } catch (err) {
+        resultsBodyEl.innerHTML = "<div class='error-card'>Request failed: " + escapeHTML(String(err)) + "</div>";
+      } finally {
+        runBtn.disabled = false;
+      }
+    }
+
+    async function runBurst() {
+      const token = tokenEl.value.trim();
+      const sql = sqlEl.value.trim();
+      const maxStaleness = Number(stalenessEl.value || 0);
+      runBtn.disabled = true;
+      try {
+        const tasks = [];
+        for (let i = 0; i < 20; i++) tasks.push(executeRequest(token, sql, maxStaleness));
+        const results = await Promise.all(tasks);
+        const statuses = results.map((r, idx) => {
+          const code = r.payload?.code || "";
+          const limited = r.response.status === 429 || code === "RATE_LIMIT_EXHAUSTED";
+          return "<span class='badge " + (limited ? "err" : "ok") + "'>" +
+            (limited ? "RL" : "OK") + " #" + (idx + 1) + " (" + r.response.status + ")" +
+            "</span>";
+        }).join("");
+        const requestLevel = results.map((r, i) => {
+          const code = r.payload?.code || "";
+          const limited = r.response.status === 429 || code === "RATE_LIMIT_EXHAUSTED";
+          const retryAfter = r.payload?.retry_after || r.payload?.retry_after_s || "n/a";
+          const message = r.payload?.message || "";
+          const traceId = r.payload?.trace_id || "n/a";
+          return (
+            "<div class='request-card " + (limited ? "err" : "ok") + "'>" +
+            "<p class='request-card-title'>Request #" + (i + 1) + " - HTTP " + r.response.status + "</p>" +
+            "<p class='request-card-line'><strong>code:</strong> " + escapeHTML(code || "OK") + "</p>" +
+            "<p class='request-card-line'><strong>latency_ms:</strong> " + escapeHTML(String(r.latency)) + "</p>" +
+            "<p class='request-card-line'><strong>retry_after:</strong> " + escapeHTML(String(retryAfter)) + "</p>" +
+            "<p class='request-card-line'><strong>trace_id:</strong> " + escapeHTML(traceId) + "</p>" +
+            "<p class='request-card-line'><strong>message:</strong> " + escapeHTML(message || "-") + "</p>" +
+            "</div>"
+          );
+        }).join("");
+        burstInspectorEl.innerHTML =
+          "<p class='section-title' style='margin-top:10px;'>Burst Responses</p>" +
+          "<div class='burst-grid'>" + statuses + "</div>" +
+          "<div class='request-cards'>" + requestLevel + "</div>";
+        const sample = results[0];
+        requestRawEl.textContent = JSON.stringify({
+          endpoint: "POST /v1/query x20 parallel",
+          authorization: "Bearer " + tokenPreview(token),
+          body: { sql: sql, max_staleness_ms: maxStaleness }
+        }, null, 2);
+        responseRawEl.textContent = JSON.stringify(results.map((r, i) => ({
+          request: i + 1,
+          status: r.response.status,
+          latency_ms: r.latency,
+          code: r.payload?.code || "",
+          message: r.payload?.message || "",
+          trace_id: r.payload?.trace_id || "",
+          retry_after: r.payload?.retry_after || r.payload?.retry_after_s || ""
+        })), null, 2);
+        renderMetadata(sample.payload, sample.response.status, sample.latency);
+
+        const throttled = results.filter((r) => r.response.status === 429 || r.payload?.code === "RATE_LIMIT_EXHAUSTED").length;
+        resultsBodyEl.innerHTML =
+          "<div class='error-card'><strong>Rate limit demo complete.</strong> " +
+          throttled + " / 20 requests were throttled with RATE_LIMIT_EXHAUSTED and Retry-After guidance.</div>";
+      } catch (err) {
+        resultsBodyEl.innerHTML = "<div class='error-card'>Burst failed: " + escapeHTML(String(err)) + "</div>";
+      } finally {
+        runBtn.disabled = false;
+      }
+    }
+
+    async function runScenario() {
+      if (!activeScenario) return;
+      if (activeScenario.run === "single") return runSingle();
+      if (activeScenario.run === "double") return runDoubleCache();
+      if (activeScenario.run === "burst") return runBurst();
+    }
+
+    runBtn.addEventListener("click", runScenario);
+    renderScenarioButtons();
+    selectScenario("cross_join");
   </script>
 </body>
 </html>

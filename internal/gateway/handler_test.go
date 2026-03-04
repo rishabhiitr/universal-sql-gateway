@@ -134,7 +134,7 @@ func newTestServer(t *testing.T, defaultRate ratelimit.Config) http.Handler {
 		githubconnector.New(1*time.Millisecond),
 		jiraconnector.New(1*time.Millisecond),
 	)
-	executor := planner.NewExecutor(registry, engine, limiter, cacheStore, 2*time.Minute)
+	executor := planner.NewExecutor(registry, engine, limiter, cacheStore, 2*time.Minute, nil)
 	handler := NewHandler(planner.NewParser(), executor, zap.NewNop())
 
 	r := chi.NewRouter()
@@ -183,21 +183,15 @@ func decodeJSON(t *testing.T, r io.Reader, v any) {
 	}
 }
 
-// ─── Freshness ───────────────────────────────────────────────────────────────
-
-// TestQueryFreshnessZeroStalenessForcesFreshFetch verifies that max_staleness_ms=0
-// always bypasses the cache (any positive staleness exceeds 0 ms).
 func TestQueryFreshnessZeroStalenessForcesFreshFetch(t *testing.T) {
 	server := newTestServer(t, ratelimit.Config{RatePerSecond: 100, Burst: 100})
 	sql := `SELECT gh.title FROM github.pull_requests gh WHERE gh.state = 'open' LIMIT 5`
 
-	// First request — populates the cache.
 	doQuery(t, server, tokenForRoles(t, []string{"admin"}), map[string]any{
 		"sql":              sql,
 		"max_staleness_ms": 60000,
 	})
 
-	// Second request with max_staleness_ms=0 — any elapsed time > 0 → cache miss.
 	second := doQuery(t, server, tokenForRoles(t, []string{"admin"}), map[string]any{
 		"sql":              sql,
 		"max_staleness_ms": 0,
@@ -215,19 +209,15 @@ func TestQueryFreshnessZeroStalenessForcesFreshFetch(t *testing.T) {
 	}
 }
 
-// TestQueryFreshnessNegativeStalenessAlwaysHitsCache verifies that max_staleness_ms=-1
-// disables the staleness gate entirely and always returns the cached result.
 func TestQueryFreshnessNegativeStalenessAlwaysHitsCache(t *testing.T) {
 	server := newTestServer(t, ratelimit.Config{RatePerSecond: 100, Burst: 100})
 	sql := `SELECT gh.title FROM github.pull_requests gh WHERE gh.state = 'open' LIMIT 5`
 
-	// First request — populates the cache.
 	doQuery(t, server, tokenForRoles(t, []string{"admin"}), map[string]any{
 		"sql":              sql,
 		"max_staleness_ms": 60000,
 	})
 
-	// Second request with max_staleness_ms=-1 → cache.Get skips staleness check → hit.
 	second := doQuery(t, server, tokenForRoles(t, []string{"admin"}), map[string]any{
 		"sql":              sql,
 		"max_staleness_ms": -1,
@@ -242,7 +232,6 @@ func TestQueryFreshnessNegativeStalenessAlwaysHitsCache(t *testing.T) {
 	}
 }
 
-// TestQueryFreshnessMSIsZeroOnLiveFetch verifies freshness_ms=0 on a cache-cold fetch.
 func TestQueryFreshnessMSIsZeroOnLiveFetch(t *testing.T) {
 	server := newTestServer(t, ratelimit.Config{RatePerSecond: 100, Burst: 100})
 	resp := doQuery(t, server, tokenForRoles(t, []string{"admin"}), map[string]any{
@@ -261,8 +250,6 @@ func TestQueryFreshnessMSIsZeroOnLiveFetch(t *testing.T) {
 	}
 }
 
-// TestQueryFreshnessMSNonZeroOnCacheHit verifies freshness_ms > 0 when data is served
-// from cache, reflecting real elapsed staleness.
 func TestQueryFreshnessMSNonZeroOnCacheHit(t *testing.T) {
 	server := newTestServer(t, ratelimit.Config{RatePerSecond: 100, Burst: 100})
 	sql := `SELECT gh.title FROM github.pull_requests gh LIMIT 1`
@@ -272,7 +259,7 @@ func TestQueryFreshnessMSNonZeroOnCacheHit(t *testing.T) {
 		"max_staleness_ms": 60000,
 	})
 
-	time.Sleep(10 * time.Millisecond) // ensure non-zero staleness is measurable
+	time.Sleep(10 * time.Millisecond)
 
 	second := doQuery(t, server, tokenForRoles(t, []string{"admin"}), map[string]any{
 		"sql":              sql,
@@ -291,10 +278,6 @@ func TestQueryFreshnessMSNonZeroOnCacheHit(t *testing.T) {
 	}
 }
 
-// ─── Response payload completeness ───────────────────────────────────────────
-
-// TestQueryResponsePayloadFields asserts every required envelope field is present
-// and well-formed on a successful response.
 func TestQueryResponsePayloadFields(t *testing.T) {
 	server := newTestServer(t, ratelimit.Config{RatePerSecond: 100, Burst: 100})
 	resp := doQuery(t, server, tokenForRoles(t, []string{"admin"}), map[string]any{
@@ -323,10 +306,6 @@ func TestQueryResponsePayloadFields(t *testing.T) {
 	}
 }
 
-// ─── CLS (column-level security) ─────────────────────────────────────────────
-
-// TestQueryCLSDeveloperEmailMasked asserts that the email column is redacted
-// for a user who does not hold the admin role, as per policy.yaml.
 func TestQueryCLSDeveloperEmailMasked(t *testing.T) {
 	server := newTestServer(t, ratelimit.Config{RatePerSecond: 100, Burst: 100})
 	resp := doQuery(t, server, tokenForRoles(t, []string{"developer"}), map[string]any{
@@ -352,7 +331,6 @@ func TestQueryCLSDeveloperEmailMasked(t *testing.T) {
 	}
 }
 
-// TestQueryCLSAdminEmailNotMasked asserts that the admin role bypasses the email mask.
 func TestQueryCLSAdminEmailNotMasked(t *testing.T) {
 	server := newTestServer(t, ratelimit.Config{RatePerSecond: 100, Burst: 100})
 	resp := doQuery(t, server, tokenForRoles(t, []string{"admin"}), map[string]any{
@@ -378,11 +356,6 @@ func TestQueryCLSAdminEmailNotMasked(t *testing.T) {
 	}
 }
 
-// ─── RLS (row-level security) ─────────────────────────────────────────────────
-
-// TestQueryRLSDeveloperSeesOnlyOwnRows verifies that a developer (alice) only receives
-// rows where author=alice, while an admin receives all rows.
-// Seed: 200 PRs, authors cycle alice/bob/charlie/dana/eva → alice has 40 rows.
 func TestQueryRLSDeveloperSeesOnlyOwnRows(t *testing.T) {
 	server := newTestServer(t, ratelimit.Config{RatePerSecond: 100, Burst: 100})
 
@@ -394,7 +367,7 @@ func TestQueryRLSDeveloperSeesOnlyOwnRows(t *testing.T) {
 
 	devResp := doQuery(t, server, tokenForRoles(t, []string{"developer"}), map[string]any{
 		"sql":              `SELECT gh.author FROM github.pull_requests gh`,
-		"max_staleness_ms": 0, // force fresh fetch to bypass admin's cached result
+		"max_staleness_ms": 0,
 	})
 	if devResp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d", devResp.StatusCode)
@@ -417,9 +390,6 @@ func TestQueryRLSDeveloperSeesOnlyOwnRows(t *testing.T) {
 	}
 }
 
-// ─── Rate-limit headers & error body ─────────────────────────────────────────
-
-// TestQueryRateLimitRetryAfterHeader asserts a 429 response carries the Retry-After header.
 func TestQueryRateLimitRetryAfterHeader(t *testing.T) {
 	server := newTestServer(t, ratelimit.Config{RatePerSecond: 0.01, Burst: 1})
 	reqBody := map[string]any{
@@ -437,8 +407,6 @@ func TestQueryRateLimitRetryAfterHeader(t *testing.T) {
 	}
 }
 
-// TestQueryRateLimitErrorBody asserts the 429 response body contains the structured
-// error vocabulary with code, message, and trace_id.
 func TestQueryRateLimitErrorBody(t *testing.T) {
 	server := newTestServer(t, ratelimit.Config{RatePerSecond: 0.01, Burst: 1})
 	reqBody := map[string]any{
@@ -461,10 +429,6 @@ func TestQueryRateLimitErrorBody(t *testing.T) {
 	}
 }
 
-// ─── Error vocabulary codes ───────────────────────────────────────────────────
-
-// TestQueryInvalidSQLErrorCode asserts the response body carries INVALID_QUERY
-// when an unsupported SQL statement is submitted.
 func TestQueryInvalidSQLErrorCode(t *testing.T) {
 	server := newTestServer(t, ratelimit.Config{RatePerSecond: 100, Burst: 100})
 	resp := doQuery(t, server, tokenForRoles(t, []string{"admin"}), map[string]any{
@@ -480,8 +444,6 @@ func TestQueryInvalidSQLErrorCode(t *testing.T) {
 	}
 }
 
-// TestQueryEntitlementDeniedErrorCode asserts the response body carries
-// ENTITLEMENT_DENIED when the caller lacks table access.
 func TestQueryEntitlementDeniedErrorCode(t *testing.T) {
 	server := newTestServer(t, ratelimit.Config{RatePerSecond: 100, Burst: 100})
 	resp := doQuery(t, server, tokenForRoles(t, []string{"guest"}), map[string]any{
@@ -497,7 +459,6 @@ func TestQueryEntitlementDeniedErrorCode(t *testing.T) {
 	}
 }
 
-// TestQueryMissingSQL asserts that omitting the sql field returns INVALID_QUERY.
 func TestQueryMissingSQL(t *testing.T) {
 	server := newTestServer(t, ratelimit.Config{RatePerSecond: 100, Burst: 100})
 	resp := doQuery(t, server, tokenForRoles(t, []string{"admin"}), map[string]any{
@@ -513,10 +474,6 @@ func TestQueryMissingSQL(t *testing.T) {
 	}
 }
 
-// ─── Single-source queries ────────────────────────────────────────────────────
-
-// TestQuerySingleSourceGitHub verifies a single-source SELECT against GitHub
-// returns rows and columns without a join.
 func TestQuerySingleSourceGitHub(t *testing.T) {
 	server := newTestServer(t, ratelimit.Config{RatePerSecond: 100, Burst: 100})
 	resp := doQuery(t, server, tokenForRoles(t, []string{"admin"}), map[string]any{
@@ -539,8 +496,6 @@ func TestQuerySingleSourceGitHub(t *testing.T) {
 	}
 }
 
-// TestQuerySingleSourceJira verifies a single-source SELECT against Jira
-// returns rows and columns without a join.
 func TestQuerySingleSourceJira(t *testing.T) {
 	server := newTestServer(t, ratelimit.Config{RatePerSecond: 100, Burst: 100})
 	resp := doQuery(t, server, tokenForRoles(t, []string{"admin"}), map[string]any{
@@ -560,10 +515,6 @@ func TestQuerySingleSourceJira(t *testing.T) {
 	}
 }
 
-// ─── Cross-app join ───────────────────────────────────────────────────────────
-
-// TestQueryCrossAppJoinReturnsMatchedRows verifies the GitHub×Jira hash join
-// returns matched rows containing columns from both sources, with 2 source metas.
 func TestQueryCrossAppJoinReturnsMatchedRows(t *testing.T) {
 	server := newTestServer(t, ratelimit.Config{RatePerSecond: 100, Burst: 100})
 	resp := doQuery(t, server, tokenForRoles(t, []string{"admin"}), map[string]any{
@@ -581,7 +532,6 @@ func TestQueryCrossAppJoinReturnsMatchedRows(t *testing.T) {
 	if len(payload.Rows) == 0 {
 		t.Fatal("expected joined rows in response")
 	}
-	// Verify rows contain projected columns from both sources.
 	firstRow := payload.Rows[0]
 	if _, ok := firstRow["gh.title"]; !ok {
 		t.Errorf("expected gh.title in joined row, got keys: %v", firstRow)

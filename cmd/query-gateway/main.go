@@ -11,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/otel/trace/noop"
 	"go.uber.org/zap"
 
 	"github.com/rishabhm/universal-sql-query-layer/internal/cache"
@@ -22,6 +23,7 @@ import (
 	"github.com/rishabhm/universal-sql-query-layer/internal/planner"
 	"github.com/rishabhm/universal-sql-query-layer/internal/ratelimit"
 	"github.com/rishabhm/universal-sql-query-layer/pkg/middleware"
+	"github.com/rishabhm/universal-sql-query-layer/pkg/tracing"
 )
 
 func main() {
@@ -42,10 +44,20 @@ func main() {
 	cacheStore := cache.New(30 * time.Second)
 	defer cacheStore.Stop()
 
+	// Init distributed tracing to Jaeger. Fall back to noop if unavailable.
+	otelEndpoint := envOrDefault("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")
+	tracer, shutdownTracer, err := tracing.Init(ctx, otelEndpoint)
+	if err != nil {
+		logger.Warn("tracing init failed, using noop tracer", zap.Error(err))
+		tracer = noop.NewTracerProvider().Tracer(tracing.ServiceName)
+		shutdownTracer = func(context.Context) error { return nil }
+	}
+	defer shutdownTracer(context.Background())
+
 	limiter := ratelimit.New(
 		ratelimit.Config{RatePerSecond: 20, Burst: 40},
 		map[string]ratelimit.Config{
-			"github": {RatePerSecond: 8, Burst: 16},
+			"github": {RatePerSecond: 8, Burst: 4}, // demo-friendly burst - set higher in production
 			"jira":   {RatePerSecond: 8, Burst: 16},
 		},
 	)
@@ -56,7 +68,7 @@ func main() {
 		jiraconnector.New(120*time.Millisecond),
 	)
 	queryParser := planner.NewParser()
-	queryExecutor := planner.NewExecutor(connectorRegistry, entitlementEngine, limiter, cacheStore, 2*time.Minute)
+	queryExecutor := planner.NewExecutor(connectorRegistry, entitlementEngine, limiter, cacheStore, 2*time.Minute, tracer)
 	queryHandler := gateway.NewHandler(queryParser, queryExecutor, logger)
 
 	secret := []byte(envOrDefault("JWT_SECRET", "dev-secret"))

@@ -163,12 +163,14 @@ The data plane caches control plane data locally with short TTLs. This eliminate
 
 | Topic | Doc |
 |---|---|
-| Request flow (gateway → planner → executor → response) | `docs/data-plane-design.md` |
-| Query planner: predicate pushdown, filter classification, join strategy | `docs/data-storage-and-cache-strategy.md` |
-| Connector SDK: interface, capability model, auth lifecycle, pagination, error codes | `docs/data-plane-design.md` |
-| Entitlement service: RLS/CLS policy DSL, execution pipeline, cache interaction | `docs/data-plane-design.md` |
-| Rate-limit service: token bucket design, fairness, async overflow path | `docs/rate-limit-design-notes.md` |
-| Freshness & cache layer: TTL, ETag/conditional fetch, two-tier cache, materialization | `docs/data-storage-and-cache-strategy.md` |
+| Request lifecycle: component map, gateway, planner, sync/async paths, end-to-end trace | `docs/data-plane/request-lifecycle.md` |
+| Connector: deployment model, SDK interface, runtime isolation, bulkhead patterns | `docs/data-plane/connector.md` |
+| Executor: entitlement enforcement (OPA/OPAL), RLS/CLS, join execution, spill, sync/async | `docs/data-plane/executor.md` |
+| Rate-limit service: token bucket design, fairness, async overflow path | `docs/data-plane/rate-limit-service.md` |
+| Freshness & cache layer: TTL, ETag/conditional fetch, two-tier cache, materialization | `docs/data-plane/freshness-and-caching.md` |
+| Join execution: hash join, sort-merge, spill strategy | `docs/data-plane/join-engine.md` |
+| Memory management: accounting, goroutine pools, resource provisioning | `docs/data-plane/memory-and-resource-mgmt.md` |
+| Prototype vs production gap | `docs/data-plane/production-gaps.md` |
 | Control plane: schema catalog, connector registry, Postgres schema, Vault | `docs/control-plane-design-notes.md` |
 | Security & compliance: mTLS, KMS, STRIDE threat model, audit, crypto-shred | `docs/security-design-notes.md` |
 | Capacity & performance: sizing math, autoscaling, SLO budget | `docs/capacity-and-performance.md` |

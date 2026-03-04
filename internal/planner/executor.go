@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/rishabhm/universal-sql-query-layer/internal/cache"
@@ -25,6 +27,7 @@ type Executor struct {
 	limiter      limiter
 	cache        *cache.TTLCache
 	cacheTTL     time.Duration
+	tracer       trace.Tracer
 }
 
 type limiter interface {
@@ -37,6 +40,7 @@ func NewExecutor(
 	limiter limiter,
 	cacheStore *cache.TTLCache,
 	cacheTTL time.Duration,
+	tracer trace.Tracer,
 ) *Executor {
 	return &Executor{
 		registry:     registry,
@@ -44,6 +48,7 @@ func NewExecutor(
 		limiter:      limiter,
 		cache:        cacheStore,
 		cacheTTL:     cacheTTL,
+		tracer:       tracer,
 	}
 }
 
@@ -154,12 +159,34 @@ func (e *Executor) fetchConcurrent(
 			if err != nil {
 				return err
 			}
-			rows, meta, err := connector.Fetch(egCtx, principal, source)
+
+			var spanCtx context.Context
+			var span trace.Span
+			if e.tracer != nil {
+				spanCtx, span = e.tracer.Start(egCtx, "connector.fetch",
+					trace.WithAttributes(
+						attribute.String("connector.id", source.ConnectorID),
+						attribute.String("connector.table", source.Table),
+						attribute.String("tenant.id", principal.TenantID),
+					),
+				)
+				defer span.End()
+			} else {
+				spanCtx = egCtx
+			}
+
+			rows, meta, err := connector.Fetch(spanCtx, principal, source)
 			if err != nil {
+				if span != nil {
+					span.RecordError(err)
+				}
 				if egCtx.Err() == context.DeadlineExceeded || strings.Contains(err.Error(), "deadline") {
 					return qerrors.New(qerrors.CodeSourceTimeout, "source timed out", source.ConnectorID, 0, err)
 				}
 				return err
+			}
+			if span != nil {
+				span.SetAttributes(attribute.Int("connector.rows_fetched", len(rows)))
 			}
 
 			e.cache.Set(cacheKey, cloneRows(rows), e.cacheTTL)
@@ -277,6 +304,16 @@ func matchRow(row models.Row, filters []models.FilterExpr) bool {
 			key = f.Left.SourceAlias + "." + f.Left.Column
 		}
 		val, ok := row[key]
+		if !ok && f.Left.SourceAlias == "" {
+			// rows are prefixed with alias; scan for suffix match
+			suffix := "." + f.Left.Column
+			for k, v := range row {
+				if strings.HasSuffix(k, suffix) {
+					val, ok = v, true
+					break
+				}
+			}
+		}
 		if !ok {
 			return false
 		}
@@ -316,8 +353,23 @@ func projectRows(rows []models.Row, projections []models.ColumnRef) []models.Row
 				key = col.Column
 			}
 
-			if val, ok := row[key]; ok {
-				outKey := key
+			val, ok := row[key]
+			if !ok && col.SourceAlias == "" {
+				// rows are prefixed with alias; scan for suffix match
+				suffix := "." + col.Column
+				for k, v := range row {
+					if strings.HasSuffix(k, suffix) {
+						val, ok = v, true
+						key = k
+						break
+					}
+				}
+			}
+			if ok {
+				outKey := col.Column
+				if col.SourceAlias != "" {
+					outKey = key
+				}
 				if col.As != "" {
 					outKey = col.As
 				}

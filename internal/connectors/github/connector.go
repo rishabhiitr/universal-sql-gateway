@@ -39,6 +39,7 @@ func (c *Connector) Schema(table string) ([]models.Column, error) {
 		return nil, fmt.Errorf("table %q not supported", table)
 	}
 	return []models.Column{
+		{Name: "id", Type: "int", Source: TablePRs},
 		{Name: "pr_number", Type: "int", Source: TablePRs},
 		{Name: "title", Type: "string", Source: TablePRs},
 		{Name: "state", Type: "string", Source: TablePRs},
@@ -81,7 +82,7 @@ func (c *Connector) Fetch(ctx context.Context, _ *models.Principal, sourceQuery 
 func seedPRs(n int) []models.Row {
 	rng := rand.New(rand.NewSource(42))
 	users := []string{"alice", "bob", "charlie", "dana", "eva"}
-	repos := []string{"acme/api", "acme/web", "acme/infra"}
+	repos := []string{"acme/api", "acme/web", "acme/infra", "my-org/my-repo"}
 	states := []string{"open", "closed"}
 
 	rows := make([]models.Row, 0, n)
@@ -90,9 +91,10 @@ func seedPRs(n int) []models.Row {
 		issueID := fmt.Sprintf("PROJ-%d", 100+(i%100))
 		createdAt := time.Now().Add(-time.Duration(rng.Intn(720)) * time.Hour).UTC()
 		rows = append(rows, models.Row{
+			"id":            i + 1,
 			"pr_number":     i + 1,
 			"title":         fmt.Sprintf("Improve service behavior #%d", i+1),
-			"state":         states[i%len(states)],
+			"state":         states[rng.Intn(len(states))],
 			"repo":          repos[i%len(repos)],
 			"jira_issue_id": issueID,
 			"author":        author,
