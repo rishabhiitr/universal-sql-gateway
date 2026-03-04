@@ -163,7 +163,7 @@ The data plane caches control plane data locally with short TTLs. This eliminate
 
 | Topic | Doc |
 |---|---|
-| Request lifecycle: component map, gateway, planner, sync/async paths, end-to-end trace | `docs/data-plane/request-lifecycle.md` |
+| Data plane overview: component map, planner internals, sync/async paths, end-to-end trace | `docs/data-plane/data-plane.md` |
 | Connector: deployment model, SDK interface, runtime isolation, bulkhead patterns | `docs/data-plane/connector.md` |
 | Executor: entitlement enforcement (OPA/OPAL), RLS/CLS, join execution, spill, sync/async | `docs/data-plane/executor.md` |
 | Rate-limit service: token bucket design, fairness, async overflow path | `docs/data-plane/rate-limit-service.md` |

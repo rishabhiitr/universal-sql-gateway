@@ -17,13 +17,12 @@ The control plane **never enforces** rate limits at runtime. It publishes config
 
 ### Data Plane — Enforcement & State
 
-The data plane owns the **runtime enforcement**:
+The data plane owns the **runtime enforcement** via a distributed rate limiter backed by Redis. At our scale target (~1k QPS), a Redis roundtrip per check is well within budget (~0.5ms p99 on the same AZ).
 
-- **Limiter instances**: Token buckets, semaphores, composite limiters — all live in-memory in the data plane, one per unique key.
-- **Allow/Deny decisions**: The executor calls `Allow()` before every connector fetch. This is on the hot path — must be sub-millisecond.
-- **State synchronization**: In multi-node deployments, limiter state is backed by Redis so that all gateway pods share the same view of remaining budget.
-- **Retry-After computation**: When a request is denied, the data plane computes the `Retry-After` header value.
-- **Async routing**: When a request is denied and the overflow policy says "async," the data plane enqueues the query to the job queue.
+- **Limiter instances**: Token buckets, semaphores, composite limiters — one per unique key, state held in Redis so all gateway pods share a single view of remaining budget.
+- **Allow/Deny decisions**: The executor calls `Allow()` before every connector fetch.
+- **Retry-After computation**: When denied, computes the `Retry-After` header value.
+- **Async routing**: When denied and overflow policy says "async," enqueues the query to the job queue.
 
 ### The Communication Pattern
 
@@ -42,13 +41,13 @@ Control Plane                              Data Plane
 └───────────────────┘                      └──────────────────────┘
 ```
 
-The data plane caches the control plane configuration locally with a short TTL (30s). This avoids synchronous lookups on the hot path. If the control plane is briefly unavailable, the data plane continues enforcing with the last-known config — rate-limit enforcement degrades gracefully, never fails open.
+The data plane caches control plane config with a 30s TTL. If the control plane is briefly unavailable, enforcement continues with last-known config — never fails open.
 
 ---
 
 ## The Four Levels of Rate Limiting
 
-A single token bucket keyed on `(tenant, connector)` is insufficient for a multi-tenant system with thousands of users per tenant. Rate limits need to be enforced at four distinct levels, each protecting against a different failure mode.
+A single token bucket keyed on `(tenant, connector)` is insufficient for a multi-tenant system. Rate limits are enforced at four levels, each protecting against a different failure mode.
 
 ### Level 1: Tenant Global
 
@@ -159,8 +158,6 @@ user_connector:
 
 ### Check Sequence
 
-The four levels are checked in order, short-circuiting on the first denial:
-
 ```
 Query arrives → AuthN → extract Principal (tenant_id, user_id)
 
@@ -197,7 +194,7 @@ Query arrives → AuthN → extract Principal (tenant_id, user_id)
    └─────────────┘ └─────────────┘  └─────────────┘
 ```
 
-L1 and L2 are checked **before** SQL parsing — they're cheap, and if the tenant/user is over budget there's no point doing any work. L3 and L4 are checked **per connector** after the planner has identified which connectors are needed. This matters: a query touching only Jira shouldn't be denied because GitHub's budget is exhausted.
+L1/L2 are checked **before** SQL parsing (cheap, short-circuit early). L3/L4 are checked **per connector** after the planner identifies which connectors are needed — a query touching only Jira shouldn't be denied because GitHub's budget is exhausted.
 
 ### Why Four Levels, Not Fewer?
 
@@ -214,38 +211,37 @@ The temptation is to collapse levels. Here's why each one is necessary:
 
 ## Connector Rate-Limit Models — The Sharp Edge
 
-This is the most important and least obvious part of the design. **Not all SaaS APIs enforce rate limits the same way.** A system that assumes "token bucket everywhere" will either over-restrict connectors that allow burst, or under-restrict connectors that don't.
+**Not all SaaS APIs enforce rate limits the same way.** A system that assumes "token bucket everywhere" will either over-restrict connectors that allow burst, or under-restrict connectors that don't.
 
 ### The Problem
 
-A token bucket with burst allows a client to send a burst of requests up front, then sustain a steady rate. This works when the SaaS API says "here's your budget for the hour, spend it however you want." But some APIs say "you can only have N requests in-flight at once" — that's a fundamentally different constraint.
+A token bucket works when the API says "here's your budget, spend it however you want." But some APIs limit concurrent in-flight requests — a fundamentally different constraint.
 
 ### Real-World Rate-Limit Models
 
 | Connector | API Rate-Limit Model | Burst Behavior |
 |---|---|---|
-| **GitHub** | 5,000 req/hour per token; header-based (`X-RateLimit-Remaining`) | Budget-based. You can spend 5,000 in the first minute if you want. Burst is fine. |
-| **Jira Cloud** | Concurrency-based (max N concurrent requests per tenant) + secondary per-minute cap | Slot-based. Exceeding concurrent slots → immediate 429 or queuing. No burst concept. |
-| **Salesforce** | Daily API call limit (e.g., 100k/day for Enterprise) + per-15s concurrent request cap | Composite. Daily budget allows burst within a day, but the 15-second concurrent cap doesn't. |
-| **Google Workspace** | Per-user per-100-second quotas (rolling window) | Rolling window. No real burst — usage is smoothed over the window. |
-| **Zendesk** | Per-minute token bucket with fixed burst size | Token bucket, but burst is capped by the vendor (e.g., burst of 10, sustained 200/min). |
-| **Notion** | 3 requests/second per integration | Fixed rate. No burst. Exceeding → 429 immediately. |
-| **Slack** | Per-method rate limits (tier 1–4) with different limits per API method | Method-specific. `conversations.list` has a different limit than `chat.postMessage`. |
+| **GitHub** | 5,000 req/hour per token; header-based (`X-RateLimit-Remaining`) | Budget-based. Burst is fine. |
+| **Jira Cloud** | Concurrency-based (max N concurrent) + secondary per-minute cap | Slot-based. No burst concept. |
+| **Salesforce** | Daily API call limit (100k/day) + per-15s concurrent cap | Composite. Daily allows burst, concurrent cap doesn't. |
+| **Google Workspace** | Per-user per-100-second quotas (rolling window) | Rolling window. No real burst. |
+| **Zendesk** | Per-minute token bucket with fixed burst size | Token bucket, vendor-capped burst. |
+| **Notion** | 3 requests/second per integration | Fixed rate. No burst. |
+| **Slack** | Per-method rate limits (tier 1–4) | Method-specific limits. |
 
 ### Limiter Types
 
-The Rate-Limit Service needs multiple limiter implementations behind the same `Allow()` interface. The correct limiter is selected based on the connector's declared rate-limit model.
+Multiple limiter implementations behind the same `Allow()` interface, selected based on the connector's declared model.
 
 #### 1. Token Bucket — For Budget-Based Connectors
 
 ```
 Use when:  The SaaS API gives you a budget for a time window and lets you spend it freely.
 Examples:  GitHub (5k/hour), Zendesk (200/min with burst)
-Behavior:  Allows burst up to the configured burst size, then sustains at the steady rate.
-           Tokens refill over time.
+Behavior:  Allows burst up to configured size, then sustains at steady rate. Tokens refill over time.
 ```
 
-The Go standard library's `golang.org/x/time/rate.Limiter` implements this correctly. The prototype already uses it.
+The prototype uses Go's `golang.org/x/time/rate.Limiter`.
 
 **Configuration per connector**:
 ```yaml
@@ -256,18 +252,17 @@ rate_limit:
   window: 1h            # for human-readable budgeting
 ```
 
-**How burst works**: If the bucket is full (100 tokens), a sudden spike of 100 requests passes immediately. Then the system sustains at ~1.38 req/sec as tokens refill. The burst parameter is set conservatively below the vendor's limit to leave headroom for retries and background operations (token refresh, webhook registration, etc.) that also consume the same API budget.
+Burst is set conservatively below the vendor's limit to leave headroom for retries and background operations (token refresh, webhooks) that share the same API budget.
 
 #### 2. Concurrency Semaphore — For Slot-Based Connectors
 
 ```
 Use when:  The SaaS API limits how many requests can be in-flight simultaneously.
 Examples:  Jira Cloud (10 concurrent), Salesforce (25 concurrent per 15s window)
-Behavior:  Admits up to N concurrent requests. The (N+1)th request blocks (with timeout)
-           or is rejected.
+Behavior:  Admits up to N concurrent requests. The (N+1)th blocks (with timeout) or is rejected.
 ```
 
-Implemented as a bounded channel or `sync.Semaphore`. The key difference from a token bucket: tokens are not consumed and refilled over time — they're **acquired** when a request starts and **released** when it completes.
+Implemented as a bounded channel or `sync.Semaphore` — slots are **acquired** at request start and **released** on completion (unlike tokens which refill over time).
 
 **Configuration per connector**:
 ```yaml
@@ -277,27 +272,19 @@ rate_limit:
   acquire_timeout: 2s     # how long to wait for a slot before returning 429
 ```
 
-**Why burst doesn't work here**: If Jira allows 10 concurrent requests and we send 50 in a burst, 40 of them get 429'd immediately. A token bucket with burst=50 would have allowed this. The concurrency semaphore correctly models the constraint: only 10 can be in-flight at any moment, regardless of how fast they arrive.
+**Why not a token bucket?** If Jira allows 10 concurrent requests and we burst 50, 40 get 429'd immediately. The semaphore correctly models the constraint: only 10 in-flight at any moment.
 
-**Lifecycle**:
-```
-request arrives → acquire semaphore slot (or timeout → 429)
-   → execute Fetch()
-   → release semaphore slot (even on error)
-```
-
-The release-on-error is critical. If a connector fetch times out or returns an error, the slot must be freed. Otherwise leaked slots shrink the effective concurrency over time until the connector is fully blocked.
+**Lifecycle**: `acquire slot → Fetch() → release slot (even on error)`. Release-on-error is critical — leaked slots shrink effective concurrency until the connector is fully blocked.
 
 #### 3. Composite — For Connectors with Multiple Constraints
 
 ```
-Use when:  The SaaS API enforces both a rate AND a concurrency limit (or a daily cap + a short-window limit).
-Examples:  Salesforce (100k/day + 25 concurrent per 15s), Slack (tiered per-method + global)
-Behavior:  Checks ALL sub-limiters. The most restrictive one wins. If any sub-limiter denies,
-           the request is denied.
+Use when:  The SaaS API enforces both a rate AND a concurrency limit.
+Examples:  Salesforce (100k/day + 25 concurrent), Slack (tiered per-method + global)
+Behavior:  Checks ALL sub-limiters. Most restrictive wins.
 ```
 
-Implemented as a wrapper that holds multiple sub-limiters and evaluates them in order:
+A wrapper holding multiple sub-limiters, evaluated in order with rollback — if any denies, all previously acquired ones are released:
 
 ```
 CompositeAllow(ctx, key):
@@ -307,8 +294,6 @@ CompositeAllow(ctx, key):
             return Deny(most restrictive Retry-After)
     return Allow
 ```
-
-**Rollback is important**: If the concurrency semaphore allows but the daily budget denies, we must release the semaphore slot. Otherwise the denied request still holds a concurrency slot it never used.
 
 **Configuration per connector**:
 ```yaml
@@ -325,7 +310,7 @@ rate_limit:
 
 ### How the Connector SDK Declares Its Rate-Limit Model
 
-The connector's capability declaration (already described in the Connector SDK section of the design doc) includes a `rate_limit` block:
+The connector's capability declaration includes a `rate_limit` block:
 
 ```yaml
 connector: github
@@ -362,11 +347,11 @@ rate_limit:
   retry_after_header: "Retry-After"
 ```
 
-The Rate-Limit Service reads these declarations at startup (cached from the Schema Catalog) and creates the correct limiter type for each connector. When a new connector is onboarded, its rate-limit model is registered automatically — no code changes to the rate-limit service.
+The Rate-Limit Service reads these at startup (cached from the Schema Catalog) and creates the correct limiter type. New connectors register their rate-limit model automatically — no code changes needed.
 
 ### Adaptive Rate Limiting — Reading Response Headers
 
-Some SaaS APIs tell us exactly how much budget remains via response headers. The connector SDK captures these and feeds them back to the Rate-Limit Service:
+Some SaaS APIs report remaining budget via response headers. The connector SDK captures these and feeds them back:
 
 ```
 Connector fetches from GitHub API
@@ -378,14 +363,9 @@ Connector passes this to Rate-Limit Service:
   UpdateBudget(tenantID, "github", remaining=4200, resetAt=...)
 ```
 
-The Rate-Limit Service can then **adjust the token bucket's fill rate** to match reality:
+The service adjusts the token bucket's fill rate to match reality — if the header says 4,200 remaining with 45 minutes left, effective rate is 93/min. This matters because **we may not be the only client using this OAuth token.** The customer's other integrations share the same credentials; adaptive limiting trusts the source's accounting over our internal estimate.
 
-- If the header says 4,200 remaining with 45 minutes until reset, the effective rate is 4200/45 = 93/min.
-- If our internal bucket thought we had 3,000 remaining (because we're not the only consumer of this token), we recalibrate downward.
-
-This is important because **we may not be the only client using this OAuth token.** The customer might have other integrations hitting the same API with the same credentials. Adaptive rate limiting keeps us honest by trusting the source's own accounting over our internal estimate.
-
-Not all connectors support this — it's declared in the capability model (`headers` block). For connectors that don't expose remaining budget, we rely purely on our internal limiter state and treat the configured limit as a hard ceiling.
+Not all connectors support this (declared via the `headers` block). Without it, we rely on internal limiter state and treat the configured limit as a hard ceiling.
 
 ---
 
@@ -406,7 +386,7 @@ Not all connectors support this — it's declared in the capability model (`head
 │  └─────────────────────────────────────────────────────────────────┘   │
 │                                                                         │
 │  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │  Limiter Pool (in-memory, Redis-backed for multi-node)          │   │
+│  │  Limiter Pool (Redis-backed, distributed across gateway pods)   │   │
 │  │                                                                 │   │
 │  │  L1 buckets:  map[tenant_id]                    → TokenBucket   │   │
 │  │  L2 buckets:  map[tenant_id:user_id]            → TokenBucket   │   │
@@ -448,11 +428,9 @@ Not all connectors support this — it's declared in the capability model (`head
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### The `Release()` Method — Why It Matters
+### The `Release()` Method
 
-For token-bucket limiters, there's nothing to release — a token is consumed and refilled by time. But for concurrency-based limiters (Jira, Salesforce), the slot must be explicitly freed when the request completes. This is why the interface has a `Release()` method in addition to `Allow()`.
-
-The executor must call `Release()` in a `defer` to guarantee slot return even on panics:
+Concurrency-based limiters (Jira, Salesforce) need explicit slot release on completion. For token-bucket connectors, `Release()` is a no-op. The executor uses `defer` to guarantee slot return:
 
 ```go
 if err := limiter.CheckConnector(ctx, tenantID, userID, connectorID); err != nil {
@@ -463,45 +441,13 @@ defer limiter.Release(tenantID, userID, connectorID)
 rows, meta, err := connector.Fetch(ctx, principal, sourceQuery)
 ```
 
-For token-bucket connectors, `Release()` is a no-op. The limiter type handles this internally.
-
 ---
 
-## State Sharing: Single-Node vs Multi-Node
+## Distributed State via Redis
 
-### Single-Node (Prototype)
+All L1–L4 limiter state lives in Redis — every `Allow()` call is a Redis `EVAL` (atomic check + decrement). At ~1k QPS this adds ~0.5ms per check, well within our latency budget. Per-pod in-memory state is never authoritative; Redis is the single source of truth so that all gateway pods share one view of remaining budget.
 
-The prototype uses an in-process `sync.RWMutex`-guarded map. This is correct for a single gateway process — all requests see the same limiter state.
-
-```go
-type Service struct {
-    mu      sync.RWMutex
-    buckets map[string]*rate.Limiter
-}
-```
-
-### Multi-Node (Production)
-
-In production, the query gateway runs as multiple pods behind a load balancer. If each pod maintains its own independent limiter state, the effective limit is multiplied by the number of pods:
-
-```
-3 gateway pods, each with a token bucket of 83 req/sec for GitHub:
-  → effective limit: 83 × 3 = 249 req/sec
-  → actual GitHub limit: 83 req/sec
-  → result: 3x overshoot → 429 from GitHub
-```
-
-The fix: **shared state via Redis.**
-
-```
-Pod A → Redis EVAL (atomic check + decrement) → allow/deny
-Pod B → Redis EVAL (atomic check + decrement) → allow/deny
-Pod C → Redis EVAL (atomic check + decrement) → allow/deny
-```
-
-All four levels (L1–L4) use Redis-backed shared state for consistency across pods. L1 and L2 may have a longer sync interval than L3/L4 since they're internal fairness controls, but they still use Redis because pod count is unknown at runtime. A slight overshoot on a tenant's global QPS doesn't cause external damage, but we still maintain a shared state to avoid the multiplier problem.
-
-**Redis rate-limit implementation**: We use Redis' `EVAL` command with a Lua script for atomic token-bucket operations. This avoids race conditions between check-and-decrement across pods. For concurrency semaphores, Redis `SETNX` with TTL provides distributed slot management with automatic slot recovery if a pod crashes without releasing.
+`EVAL` with Lua scripts handles atomic token-bucket operations; `SETNX` with TTL provides distributed semaphore slots with auto-recovery on pod crash.
 
 ```
 Key schema in Redis:
@@ -510,25 +456,17 @@ Key schema in Redis:
   rl:sem:{tenant_id}:{connector_id}        → set of active slot holders (with TTL)
 ```
 
+> **Prototype shortcut**: The prototype uses an in-process `sync.RWMutex`-guarded map for simplicity. Production replaces this with Redis — the `Allow()` interface is unchanged.
+
 ### Failure Mode: Redis Down
 
-If Redis is unreachable, the Rate-Limit Service falls back to local in-process limiters with a **conservative multiplier**:
-
-```
-Configured limit: 5000 req/hour
-Number of gateway pods: 3 (known from k8s Endpoints API or env var)
-Fallback limit per pod: 5000 / 3 = 1666 req/hour
-```
-
-This is intentionally pessimistic — it under-allocates to avoid overshooting the external limit. When Redis recovers, the service switches back to shared state seamlessly.
-
-The fallback is logged and emitted as a Prometheus metric (`ratelimit_redis_fallback_active{connector=...}`) so that operators know the system is running degraded.
+Falls back to local in-process limiters with a conservative per-pod budget: `configured_limit / pod_count`. Intentionally pessimistic to avoid overshooting external limits. When Redis recovers, switches back seamlessly. The fallback is emitted as `ratelimit_redis_fallback_active{connector=...}`.
 
 ---
 
 ## Interaction with Cache Layer
 
-Rate-limit checks and cache checks happen in a specific order, and the ordering matters:
+Rate-limit checks and cache checks happen in a specific order:
 
 ```
 Per connector fetch:
@@ -545,13 +483,9 @@ Per connector fetch:
      └── MISS: call connector.Fetch() → consume external API budget
 ```
 
-**The critical question: should a cache hit consume a rate-limit token?**
+**Should a cache hit consume a rate-limit token?** No — the token represents an external API call that a cache hit avoids. But we check L3/L4 *before* the cache lookup.
 
-**Answer: No.** The rate-limit token represents an external API call. A cache hit avoids the API call entirely. Consuming a token on cache hits would artificially reduce the budget available for actual API calls.
-
-But wait — we checked L3/L4 *before* the cache lookup. If the cache hits, we consumed a token unnecessarily.
-
-**Resolution**: The check at step 1-2 is a **reservation**, not a consumption. If the cache hits, the reservation is cancelled (the token is returned to the bucket). If the cache misses, the reservation is committed.
+**Resolution**: The check is a **reservation**, not a consumption. Cache hit → reservation cancelled (token returned). Cache miss → reservation committed.
 
 ```go
 reservation := limiter.Reserve(tenantID, connectorID)
@@ -565,15 +499,13 @@ if cached, _, ok := cache.Get(cacheKey, maxStaleness); ok {
 rows, meta, err := connector.Fetch(ctx, principal, sourceQuery)
 ```
 
-For concurrency semaphores, the slot is acquired before cache check (because we need it if the cache misses), and released immediately on cache hit. The slot hold duration on cache hits is negligible (microseconds).
+For concurrency semaphores, the slot is acquired before cache check and released immediately on hit (microseconds hold time).
 
 ---
 
 ## Async Overflow Path
 
-When L3 or L4 denies a request, the default behavior is a 429 with `Retry-After`. But for some query patterns, this is a poor UX — the user submitted a legitimate query that just happened to arrive when the budget was exhausted.
-
-The async overflow path provides an alternative:
+When L3/L4 denies a request, the default is a 429 with `Retry-After`. The async overflow path provides an alternative:
 
 ```
 L3 denies → check async overflow policy for this tenant×connector
@@ -591,25 +523,17 @@ Policy = "async":
       "estimated_completion_ms": 45000,
       "poll_url": "/v1/jobs/abc123"
     }
-  → job executor picks up the query when rate-limit budget refills
+  → job executes when rate-limit budget refills
   → client polls /v1/jobs/{id} or receives webhook notification
 ```
 
-**Which queries are eligible for async?** Not all. The decision is based on:
+**Eligibility** depends on tenant policy (admin enables per connector), query type (partial async for JOINs where one connector is throttled), and client hint (`"allow_async": true`).
 
-- **Tenant policy**: Admin enables/disables async per connector.
-- **Query type**: JOIN queries that touch multiple connectors can be partially async (one connector is throttled, the other isn't — fetch the available one now, queue the throttled one).
-- **Client hint**: The request can include `"allow_async": true` to opt in.
-
-Queries that are NOT eligible for async (always synchronous 429):
-- Queries with `max_staleness: 0` (the user explicitly wants live data — an async response that arrives in 45 seconds defeats the purpose).
-- Queries from interactive UIs where the user is waiting for an immediate response (indicated by client hint or inferred from the presence of short timeout).
+**Always synchronous 429**: Queries with `max_staleness: 0` (user wants live data) or from interactive UIs with short timeouts.
 
 ---
 
 ## Error Vocabulary
-
-Every connector maps source-specific errors to a standard code before returning to the executor. The executor handles only these codes; raw source messages are preserved in the `message` field for observability but never surface to the user as-is.
 
 | HTTP / condition | Standard code | Meaning |
 |---|---|---|
@@ -648,35 +572,28 @@ Rate-limit denials produce structured, actionable errors:
 }
 ```
 
-Key properties of the error response:
+Key fields:
 
-- **`level`**: Tells the caller *which* rate limit was hit (`tenant_global`, `user_global`, `tenant_connector`, `user_connector`). Different levels require different remediation.
-- **`retry_after_seconds`**: Computed from the limiter's refill schedule. For token buckets, it's time until enough tokens refill to serve the request. For concurrency semaphores, it's an estimate based on average request duration.
-- **`budget`**: Shows the full budget picture so the caller can make informed decisions (e.g., "I've used 4,800 of 5,000 — I should stop polling and wait").
-- **`suggestion`**: Human-readable guidance. This varies by level:
-  - L1/L2: "Reduce query frequency or contact your tenant admin."
-  - L3: "Retry after Xs, increase max_staleness, or upgrade API plan."
-  - L4: "You've consumed your share of the connector budget. Other users are also querying this source."
-- **`async_available`**: If the async overflow path is enabled for this connector and the query is eligible, the client can re-submit with `"allow_async": true`.
+- **`level`**: Which rate limit was hit (`tenant_global`, `user_global`, `tenant_connector`, `user_connector`) — different levels require different remediation.
+- **`retry_after_seconds`**: Computed from the limiter's refill schedule (token refill time or estimated request duration for semaphores).
+- **`budget`**: Full budget picture so callers can make informed decisions.
+- **`suggestion`**: Human-readable guidance varying by level (L1/L2: reduce frequency; L3: retry/cache/upgrade; L4: share exhaustion notice).
+- **`async_available`**: Whether the client can re-submit with `"allow_async": true`.
 
 ---
 
 ## Fairness Across Tenants — Head-of-Line Blocking Avoidance
 
-In a multi-tenant deployment, all tenants share gateway pods. A tenant that's being rate-limited (waiting for `Retry-After` to elapse) must not block other tenants' queries.
+In a multi-tenant deployment, a rate-limited tenant must not block others. The design avoids this through:
 
-The design avoids this by:
-
-1. **Non-blocking rate-limit checks**: `Allow()` never sleeps. It returns immediately with allow or deny. The caller decides whether to wait, retry, or fail.
-2. **Per-tenant limiter isolation**: Each tenant's limiter is a separate object. A slow `Reserve()` call for ACME doesn't lock the mutex for BigCorp's limiter.
-3. **Errgroup per query, not per tenant**: The executor uses `errgroup` per query execution. A rate-limited connector in one query doesn't affect another query's goroutines.
-4. **No shared queues**: The async overflow path uses per-tenant queue partitions (e.g., SQS message groups keyed by tenant_id). A tenant with 10,000 queued jobs doesn't delay another tenant's first job.
+1. **Non-blocking checks**: `Allow()` never sleeps — returns immediately with allow or deny.
+2. **Per-tenant limiter isolation**: Each tenant's limiter is a separate object. No cross-tenant mutex contention.
+3. **Errgroup per query**: A rate-limited connector in one query doesn't affect another query's goroutines.
+4. **Per-tenant queue partitions**: Async overflow uses per-tenant SQS message groups — 10k queued jobs for one tenant don't delay another's first job.
 
 ---
 
 ## Observability
-
-The Rate-Limit Service emits the following signals:
 
 ### Prometheus Metrics
 
@@ -715,7 +632,7 @@ Span: ratelimit.check
   Duration: 0.2ms
 ```
 
-On denial, the span includes `retry_after_seconds` and `budget.*` attributes, making it easy to correlate rate-limit events with query latency in Jaeger.
+On denial, the span includes `retry_after_seconds` and `budget.*` attributes for correlation in Jaeger.
 
 ### Alerts
 
@@ -735,8 +652,8 @@ On denial, the span includes `retry_after_seconds` and `budget.*` attributes, ma
 |---|---|
 | **Four-level hierarchy** | Each level protects against a different failure mode. Collapsing any level leaves a gap. |
 | **Connector-declared rate-limit model** | Burst is a connector property, not a system property. A universal token bucket is incorrect for slot-based APIs. |
-| **Policy in control plane, enforcement in data plane** | Configuration changes (new tenant override) don't require data plane redeployment. Enforcement is on the hot path — must be sub-millisecond. |
-| **Redis-backed state for L1–L4** | All four levels use Redis-backed shared state to avoid the pod-count multiplier problem. L1/L2 may have a longer sync interval than L3/L4 since they're internal fairness controls, but they still require global consistency across pods. |
-| **Reservation pattern with cache** | Cache hits shouldn't consume rate-limit tokens. The reservation is cancelled on hit, committed on miss. |
-| **Async overflow as opt-in** | Not all queries benefit from async. Interactive queries should fail fast; batch queries should queue gracefully. |
-| **Adaptive recalibration from headers** | We may not be the only consumer of the API credentials. The source's own accounting is more accurate than ours. |
+| **Policy in control plane, enforcement in data plane** | Config changes don't require data plane redeployment. Enforcement is on the hot path — must be sub-millisecond. |
+| **Redis-backed state for L1–L4** | Avoids the pod-count multiplier problem. L1/L2 may have longer sync intervals but still require global consistency. |
+| **Reservation pattern with cache** | Cache hits shouldn't consume rate-limit tokens. Reservation is cancelled on hit, committed on miss. |
+| **Async overflow as opt-in** | Interactive queries should fail fast; batch queries should queue gracefully. |
+| **Adaptive recalibration from headers** | We may not be the only consumer of the API credentials. Source's own accounting is more accurate. |

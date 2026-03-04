@@ -95,70 +95,33 @@ Query 4: WHERE assignee = 'rishabh' AND priority = 'high' AND created > '2024-01
 
 One API call. Four queries served. That's the difference between a 5% hit rate and a 70-80% hit rate.
 
-### The Trade-off the Planner Makes
-
-```
-Push MORE predicates → smaller API response → less bandwidth → LOW cache reuse
-Push FEWER predicates → larger API response → more bandwidth → HIGH cache reuse
-```
-
-This is a cost-based decision. The planner weighs:
-
-- **Response size**: Broader fetch returns 1,000 rows? Manageable. 1M rows? Push more predicates to narrow it down.
-- **Existing cache**: Is there already a cached broad fetch that covers this query? If yes, don't fetch at all.
-- **Local filtering cost**: Cheap. DuckDB / in-memory filtering handles thousands of rows in microseconds.
-
 ### Predicate Classification: What Gets Pushed vs. Stripped
 
-The planner doesn't make ad-hoc decisions about which predicates to push. Each predicate in the WHERE clause is classified into one of three categories, driven jointly by the **connector's declared schema** and the **predicate's nature**.
+Every predicate in a WHERE clause falls into exactly one of three categories. The classification is static — driven by the connector's declared schema, not by runtime guesses about result size.
 
-**Category 1 — Partition predicates (always pushed, always in cache key)**
+**Category 1 — Partition predicates.** Always pushed. Always in the cache key.
 
-These define the natural scope of a connector fetch. Every connector declares which columns are *partition dimensions* — they correspond to how the SaaS API organizes data:
+These are the columns the upstream API *requires* to scope a request. You cannot call the API without them, and data across different partitions is unrelated — caching across them is meaningless.
 
-| Connector | Partition Dimensions | Why |
+| Connector | Partition Dimensions | Reason |
 |---|---|---|
-| GitHub | `repo`, `owner` | GitHub API scopes to a repo — you can't list PRs without specifying one |
-| Jira | `project` | Jira API scopes to a project |
-| Salesforce | `object_type` | Each Salesforce object (Account, Contact) is a separate API endpoint |
+| GitHub | `repo`, `owner` | API requires a repo — no "list all PRs across all repos" endpoint |
+| Jira | `project` | API scopes to a project key |
+| Salesforce | `object_type` | Each object (Account, Contact) is a separate endpoint |
 
-Partition predicates are always pushed because:
-1. The API requires them (you can't fetch "all repos" in one call)
-2. They define genuinely separate data domains — cache reuse across partitions is meaningless
-3. They bound the fetch size to a manageable scope
+**Category 2 — Entitlement predicates.** Never pushed. Never in the cache key.
 
-**Category 2 — User-identity / entitlement predicates (never pushed, always applied post-fetch)**
+These come from the user's token and tenant policy, not from SQL. RLS predicates (`owner_id = 'alice'`), CLS masks (`salary → MASKED`), implicit scopes added by the Entitlement Service. Keeping them out of the cache key is what makes the cache tenant-scoped rather than user-scoped. See [§5 — How Entitlements Interact with Cache](#5-how-entitlements-rlscls-interact-with-cache).
 
-These are derived from the user's token, role, or tenant policy — not from the SQL WHERE clause:
+**Category 3 — Value filters.** Stripped by default; pushed only when they bound an unbounded fetch.
 
-- RLS predicates: `owner_id = 'alice'`, `team IN ('engineering', 'platform')`
-- CLS masks: `salary → MASKED`, `ssn → REDACTED`
-- Implicit scoping: anything the Entitlement Service adds based on user context
+Everything else: `state = 'open'`, `priority = 'high'`, `assignee = 'alice'`, `created_at > '2024-01-01'`. The rules:
 
-These are **never** pushed to the API and **never** appear in the cache key. This is what makes the cache tenant-scoped rather than user-scoped. See [§5 — How Entitlements Interact with Cache](#5-how-entitlements-rlscls-interact-with-cache) below.
+- **Low-cardinality columns** (e.g. `state`: 3 possible values) — strip. One broader cache entry serves all values; post-filter locally in microseconds.
+- **High-cardinality columns** (e.g. `assignee`: 5,000 users) — strip. Pushing creates per-user cache entries, defeating shared caching.
+- **Time boundaries** (e.g. `created_at > '2024-01-01'`) — push a broadened version (round down to month boundary) to prevent unbounded historical fetches while preserving reuse.
 
-**Category 3 — Value filters (judgment call — push or strip based on cardinality)**
-
-These are the remaining WHERE predicates from the user's SQL: `state = 'open'`, `priority = 'high'`, `assignee = 'alice'`, `created_at > '2024-01-01'`.
-
-The planner decides whether to push or strip each one based on a simple heuristic:
-
-```
-IF the filter column has LOW cardinality (state: open/closed/merged → 3 values)
-   → STRIP it. Don't push.
-   → One broader cache entry serves queries for ALL state values.
-   → Post-filter locally (microseconds on a few thousand rows).
-
-IF the filter column has HIGH cardinality (assignee among 5000 users)
-   → STRIP it. This is effectively a user-identity filter.
-   → Pushing it creates per-user cache entries — defeats the purpose.
-
-IF the filter defines a TIME BOUNDARY (created_at > '2024-01-01')
-   → Push a BROADENED version (e.g., round down to month boundary).
-   → Prevents unbounded historical fetches while preserving cache reuse.
-```
-
-In practice, most Category 3 predicates are stripped. The default bias is toward broader fetches because local filtering is cheap and cache reuse is valuable.
+Default bias: strip and post-filter. Local filtering is microseconds on a few thousand rows; cache reuse across queries is worth far more.
 
 **How connectors declare this**
 
@@ -175,24 +138,20 @@ github_connector:
 
 `api_filterable` tells the planner which columns the API *can* filter on — but the planner is not obligated to push them. It will only push an `api_filterable` column if the response size without it would be unmanageable (e.g., a repo with 50K PRs where pushing `state=open` reduces it to 200).
 
-**The "select all" problem doesn't exist**
-
-Because partition predicates are always pushed, you never fetch "all data in the tenant." The broadest possible fetch is "all rows within one partition" (e.g., all issues in one Jira project, all PRs in one GitHub repo). This is the connector's natural scope — the SaaS API is designed to return data at this granularity.
-
 ### Predicate Subsumption
 
-The planner can go further. Even if the pushed predicates don't match exactly, it checks whether an existing cached fetch is a **superset**:
+Cache lookup is not exact-match only. During cache orchestration (step 4 of the [executor's per-source loop](executor.md#3-per-source-execution-loop)), the executor checks whether an existing cached fetch is a **superset** of the current query's pushed predicates:
 
 ```
 Cached fetch:  {assignee: 'rishabh'}              → 3000 rows (all projects)
 New query:     {assignee: 'rishabh', project: 'ENG'}  → subset
 
-Planner detects: cached predicate is BROADER than needed
+Executor detects: cached predicate is BROADER than needed
   → Filter project = 'ENG' locally from cached data
   → CACHE HIT, no API call
 ```
 
-This is what makes the cache truly effective — it's not just exact-match lookup, it's set-containment reasoning on predicates.
+The planner classifies predicates (§3 above). The executor uses that classification at runtime to perform cache lookup, subsumption checks, and post-fetch filtering.
 
 ---
 
@@ -239,37 +198,24 @@ type CacheEntry struct {
 
 Both TTLs are overridable per-connector in config and per-query via the `max_staleness` hint.
 
-#### Revalidation Flow (for ETag-capable connectors)
+#### Revalidation Flow
+
+Revalidation is request-triggered. When a request arrives, the executor checks cache age:
 
 ```
-t=0        → cache miss → fetch → store rows + ETag; set soft_ttl=+5m, hard_ttl=+30m
-t < 5min   → soft TTL fresh   → serve immediately, no background work
-t = 6min   → soft TTL expired → serve stale rows + fire ONE background revalidation goroutine
-               background: GET with If-None-Match: "<etag>"
-                 → 304 Not Modified → reset soft_ttl=+5m, keep rows (data unchanged)
-                 → 200 with new body → update rows + new ETag, reset both TTLs
-t = 31min  → hard TTL expired → synchronous re-fetch; user waits
+Within soft TTL       → serve from cache. Done.
+Between soft and hard → serve stale data to caller immediately.
+                        If connector supports ETag/If-Modified-Since:
+                          fire async conditional fetch (goroutine, caller doesn't wait)
+                          304 → reset soft TTL, keep rows
+                          200 → replace rows, reset both TTLs
+                        If not:
+                          data stays until hard TTL expires.
+Past hard TTL         → synchronous re-fetch. Caller waits.
+max_staleness = 0     → always re-fetch; update cache async so subsequent queries benefit.
 ```
 
-The requesting user at `t=6min` sees zero added latency — they get stale data while revalidation happens behind the scenes. Stale data is at most `(time since soft TTL expired)` old, typically seconds to low minutes.
-
-For connectors without ETag support, soft TTL and hard TTL collapse to the same value — there is no cheap way to extend freshness without a full re-fetch.
-
-### ETag / Conditional Fetch Details
-
-When the cache entry is stale but not expired past hard TTL, we try a conditional fetch before doing a full re-fetch:
-
-```
-System → Jira API:
-  GET /rest/api/3/search?jql=assignee=rishabh
-  Headers: If-Modified-Since: 2026-02-27T10:00:00Z
-
-Jira responds:
-  304 Not Modified  → serve cached data, update fetched_at, near-zero cost
-  200 OK            → new data, replace cache entry
-```
-
-This is powerful because a 304 response costs almost nothing against the rate-limit budget but keeps the cached data validated. Not all connectors support this — the Connector SDK's capability model declares whether ETag/conditional requests are available, and the planner uses this to decide the fetch strategy.
+A 304 costs almost nothing against the rate-limit budget — GitHub doesn't even count it. Connectors without ETag support have soft TTL = hard TTL (no cheap way to extend freshness); the Connector SDK's capability model declares this.
 
 ### The `max_staleness` Knob
 
@@ -369,22 +315,6 @@ go revalidationGroup.Do(cacheKey, func() (interface{}, error) {
 ```
 
 Without this, 500 goroutines would each fire a conditional GET — burning 500 rate-limit tokens for what should be one API call.
-
-### Rate-Limit Gate on Revalidation
-
-Even a 304 response consumes a rate-limit token on most SaaS APIs. The background revalidation goroutine checks the rate-limit service before firing. If the tenant's budget is constrained, it silently extends the soft TTL instead of burning a token:
-
-```go
-func revalidate(key string, etag string) {
-    if !rateLimiter.TryAcquire(connectorID, tenantID) {
-        // Budget tight — extend soft TTL, don't waste a token
-        entry.SoftTTL = time.Now().Add(softTTLDuration)
-        return
-    }
-    // Fire conditional GET with If-None-Match: etag
-    // ...
-}
-```
 
 ### Size-Based Tiering: Redis vs. S3
 
@@ -559,7 +489,7 @@ Cache strategy and entitlements don't conflict — they operate at different sta
 
 ## 6. Join Materialization
 
-For cross-app joins (e.g., GitHub PRs joined with Jira Issues), both sides go through the same fetch-cache pipeline independently. Once both fetch results are available (from cache or live), the join executes locally:
+Both sides of a cross-app join go through the fetch-cache pipeline independently. Once both results are available (from cache or live), the join executes locally:
 
 ```
 Query: SELECT p.title, i.status
@@ -572,58 +502,28 @@ Step 3: Hash join in-process (DuckDB / in-memory)    → local, fast
 Step 4: Return joined result
 ```
 
-The materialized join result itself is **not cached** — it's computed on the fly from the two cached fetches. This avoids a combinatorial explosion of join-result cache entries while still benefiting from fetch-level caching on each side.
+If both sides are cache-warm, the entire join query completes with zero API calls.
 
-If both sides are cache-warm, the entire join query is answered with zero API calls.
+### Two Tiers
 
-### Two-Tier Architecture: Source Cache + Materialization Cache
+**Source cache** (always on) — caches raw connector responses keyed by `(connector + table + pushed_predicates + tenant)`. In-memory (Redis). This is what avoids redundant API calls.
 
-In production, the caching layer extends to two tiers that serve different purposes:
+**Materialization cache** (conditional) — caches joined results that exceed a size threshold (~1MB serialized). Stored as encrypted Parquet on S3, with a Redis pointer (`mat:<plan_hash>:<tenant> → s3://...`). Short TTL (≤ 30 min), crypto-shredded on tenant offboarding.
 
-**Tier 1 — Source Cache** (always on)
-- Caches raw connector responses (what we fetched from the SaaS API)
-- Keyed by `(connector + table + pushed_predicates + tenant)`
-- In-memory (Redis for distributed, in-process for single-node)
-- TTL driven by freshness config + `max_staleness` per query
-- Avoids redundant API calls across different queries hitting the same source data
+The trigger is result size only — no frequency counters. Small joins are sub-millisecond from source cache + in-memory hash join; only large joins (100K+ rows per side) are worth persisting. S3 instead of node-local storage because stateless routing means no guarantee a query lands on the same node twice. An S3 GET (~20-50ms) is still far cheaper than re-fetching from two SaaS APIs.
 
-**Tier 2 — Materialization Cache** (conditional, production only)
-- Caches joined/aggregated results that exceed a size threshold (configurable, default ~1MB serialized)
-- Keyed by `(query plan hash + tenant)`
-- **Canonical storage: encrypted Parquet on S3** — any node can read the result regardless of which node computed it
-- **Pointer in Redis**: `mat:<plan_hash>:<tenant> → s3://bucket/<tenant>/<plan_hash>.parquet` with TTL matching the materialization TTL
-- **Optional local read-through**: Nodes can keep a local DuckDB copy as a read-through cache of the S3 file. Pure latency optimization — S3 + Redis pointer is always the source of truth.
-- Short TTL (≤ 30 min), crypto-shredded on tenant offboarding
+**Why materialization caching matters.** It pays off in two cases: (1) the join itself is expensive — re-fetching from two SaaS APIs and re-computing a hash join over 100K+ rows costs minutes of wall time and rate-limit budget, while an S3 GET is ~30ms; (2) source caches have expired but the joined result is still within the caller's staleness tolerance — the materialized result has its own TTL, so it can outlive the individual source caches and avoid unnecessary re-fetches.
 
-**Single trigger: result size.** Materialization kicks in only when the join result exceeds the size threshold. There is no frequency counter or hit-rate tracking. Why? For small join results, source cache + in-memory hash join is sub-millisecond — adding a counter system, threshold tuning, and race-condition handling to save <1ms is not worth the complexity. Large results (100K+ rows per side) are genuinely expensive to re-fetch and re-join; those are the only ones worth persisting.
+### Lookup
 
-**Why S3, not node-local storage?** In a horizontally scaled data plane with stateless routing, there is no guarantee a query lands on the same node twice. If the materialized result only lived in a local DuckDB file on the node that computed it, every other node would miss. S3 makes the materialized result globally reachable. An S3 GET (~20-50ms) is still far cheaper than re-fetching from two SaaS APIs and re-joining.
+The executor checks both tiers in parallel — they answer different questions ("do I have raw data from each source?" vs. "do I have the joined result?"):
 
-**Write path**: After computing an expensive join that exceeds the size threshold, write the encrypted Parquet to S3 and store the pointer in Redis (single `SET` with TTL). The write is fire-and-forget (background goroutine) — the first caller already has the result in memory, and subsequent queries benefit once the S3 write lands.
-
-**Read path**: Any node checks Redis for the materialization key. On hit, pull Parquet from S3 (or from the local DuckDB read-through cache if warm). On miss, fall through to source cache or live fetch.
-
-### Lookup Strategy: Parallel Check, Prioritized Pull
-
-These are **independent lookups, not a fallback chain.** Source cache answers "do I have raw data from each connector?" while materialization cache answers "do I have the joined result for this plan?" These are different questions, so we check both in parallel.
-
-**Step 1**: Check existence of keys in both tiers (parallel, sub-ms for source cache in Redis, one Redis `GET` for the materialization pointer)
-
-**Step 2**: Decide which path to take based on what's available:
-
-| Source Cache | Materialization Cache | Action |
+| Source Cache | Materialization | Action |
 |---|---|---|
-| All sides hit | — | Pull from source cache (memory), re-join locally. Fastest path for small-medium result sets. |
-| Miss | Hit (Redis pointer exists) | Pull Parquet from S3 (or local DuckDB read-through if warm). Avoids re-fetching from SaaS API entirely. |
-| Partial hit | Miss | Fetch only missing sides from connectors, join with cached sides. |
-| Miss | Miss | Full live fetch from all connectors. |
-
-### When Materialization Pays Off
-
-Materialization is not about speed — source cache is in-memory (sub-ms) while materialization is disk/S3 (tens of ms). Materialization pays off in exactly two scenarios:
-
-1. **The join itself is expensive**: Large result sets where re-joining costs more than an S3 read (e.g., joining 100K+ rows from each side). Re-fetching from two SaaS APIs and re-computing a hash join over 100K+ rows is minutes of wall time and rate-limit budget. An S3 GET is ~30ms.
-2. **Source cache has expired but join result is still valid**: The materialized join can have a longer TTL than individual source caches, because the join work has already been done. This avoids re-fetching from SaaS APIs when the joined result is still within the caller's staleness tolerance.
+| All sides hit | — | Re-join locally from source cache. Fastest path. |
+| Miss | Hit | Pull Parquet from S3. Avoids SaaS API calls entirely. |
+| Partial hit | Miss | Fetch missing sides from connectors, join with cached sides. |
+| Miss | Miss | Full live fetch. |
 
 ---
 
@@ -642,42 +542,16 @@ This keeps us squarely in "query accelerator" territory and avoids any complianc
 
 ## 8. Cache Topology (Redis Cluster)
 
-### Production Cache: Redis Cluster, Not Standalone
-
-The prototype uses an in-process Go map. Production uses Redis Cluster (6+ nodes, 16384 hash slots). Cache keys are distributed across nodes via consistent hashing.
+Production uses Redis Cluster (6+ nodes, 16384 hash slots). The prototype uses an in-process Go map.
 
 ```
 Cache key = SHA256(tenant + connector + table + pushed_predicates)
-  → hashes to a slot (0-16383)
-  → slot maps to one specific Redis node
-  → one GET, one node, one round trip (~0.5ms)
+  → hashes to slot (0-16383) → one Redis node → one GET, ~0.5ms
 ```
 
-### Distribution Strategy: Scattered, Not Connector-Affine
+Keys scatter naturally via consistent hashing — no connector-affine pinning (that creates hot nodes). Different tenants and predicate combinations spread across slots even if one connector dominates traffic.
 
-Do NOT pin connectors to specific Redis nodes (e.g., "all GitHub cache on node 1"). That creates hot-node problems when one connector is popular. Instead, let consistent hashing scatter keys naturally.
-
-This works because different queries produce different cache keys:
-- Different tenants → different hash
-- Different pushed predicates → different hash
-- Same tenant + same connector + same filters → same hash (intentional: cache hit)
-
-The result: cache load distributes evenly across nodes even if one connector gets 80% of traffic, because different tenants and filter combinations spread across different hash slots.
-
-### Fetch Is Always Single-Key
-
-Because the cache key hashes the full pushed predicate set into one key, a cache lookup is always one `GET` to one node. No scatter-gather.
-
-```
-Single-source query: 1 Redis GET → 1 node  → ~0.5ms
-JOIN query:          2 Redis GETs → 1-2 nodes → ~1ms (pipelined)
-```
-
-For JOINs, the two source cache lookups can be pipelined (send both GETs before waiting for either response). Even if they land on different Redis nodes, total latency is ~1ms — negligible vs SaaS API latency (50-800ms).
-
-### Hot-Key Risk
-
-The only hot-key scenario: thousands of concurrent requests for the exact same `(tenant + connector + table + filters)`. But this is a cache *hit* — Redis handles millions of reads/sec per node, so a hot read key isn't a problem. It only becomes a concern if the cached value is very large (>1MB), in which case network bandwidth from that Redis node could saturate. For very large cached results, the source cache stores a pointer to S3, not the data itself.
+Lookups are always single-key. JOINs issue two pipelined GETs (~1ms total). Hot read keys aren't a problem — Redis handles millions of reads/sec per node. Large entries (>1MB) store a pointer to S3, not the data itself.
 
 ---
 

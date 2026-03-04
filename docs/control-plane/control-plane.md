@@ -24,29 +24,43 @@ The control plane is a single Go service backed by one Postgres database. All co
 | Table | What It Stores | Keyed On |
 |---|---|---|
 | `tenants` | Tenant registry (id, status, region, created_at) | `tenant_id` |
-| `tenant_connectors` | Which connectors enabled per tenant, version, config overrides | `(tenant_id, connector_id)` |
+| `tenant_connectors` | Which connectors enabled per tenant, credentials path, config overrides | `(tenant_id, connector_id)` |
 | `rate_limit_configs` | Per (tenant, connector) rate limits (req/min, burst) | `(tenant_id, connector_id)` |
 | `entitlement_policies` | RLS/CLS rules — allowed roles, row filters, column masks | `(tenant_id, table)` |
 | `schema_catalog` | Tables, columns, types, connector capability declarations | `(connector_id, table)` |
 
-### Connector Versioning & Onboarding
+### Connectors: Development, Deployment, and Tenant Enablement
 
-Connectors are versioned (`major.minor.patch`). The `tenant_connectors` table stores the active version per tenant. Admins onboard connectors via YAML config or the Admin Console:
+Three distinct concerns — owned by different people, on different timelines.
+
+#### 1. Connector Development (engineering)
+
+A connector is Go code that translates SQL operations into SaaS API calls. Each connector implements the `Connector` interface (see [`docs/data-plane/connector.md`](../data-plane/connector.md)) — schema discovery, predicate pushdown, pagination, auth token injection, error mapping. This is engineering work: code review, tests, CI. A new connector for a SaaS app doesn't exist until someone writes and ships this translation layer.
+
+The `schema_catalog` table stores the connector's capability declarations (supported tables, columns, filterable fields, pagination model) — populated by the connector's `Capabilities()` method, not by admin config.
+
+#### 2. Connector Deployment (platform/infra)
+
+Connectors run in-process with the data plane gateway. Deploying a new connector version means deploying a new gateway binary. Versioning (`major.minor.patch`), canary rollout, and rollback are handled by the deployment pipeline (Helm, k8s rolling updates) — not by tenant config. All tenants on a given data plane instance run the same connector code version.
+
+Breaking changes (schema renames, removed fields) require a major version bump, a migration path, and coordination with affected tenants before rollout.
+
+#### 3. Tenant Enablement (admin config)
+
+Once a connector is deployed, admins enable it for a tenant. This is the config operation — stored in `tenant_connectors`:
 
 ```yaml
 tenant: acme-corp
 connectors:
   - id: github
-    version: "1.3.0"
     credentials_vault_path: "secret/acme/github"
     rate_limit_override:
       requests_per_minute: 500   # acme has a GitHub Enterprise plan
   - id: jira
-    version: "2.1.0"
     credentials_vault_path: "secret/acme/jira"
 ```
 
-Version upgrades are non-breaking by default. Breaking changes (schema renames, removed fields) require a major version bump and a migration path in the connector changelog.
+This config controls: which connectors the tenant can query, where their credentials live in Vault, and any rate-limit overrides tied to their SaaS plan tier. 
 
 ### External Stores
 
@@ -115,67 +129,19 @@ The data plane caches control plane data locally with short TTLs. This eliminate
 
 ---
 
-## Staleness Inventory: What Happens When Cached Data is Stale
+## Entitlement / Authorization
 
-### Tiered by Severity
+### Why OPA + OPAL
 
-**High severity (security boundary):**
+The core authorization decision is table-level gating: can this `(user_role, tenant)` pair query this table? At scale, enterprise customers will need richer rules — time-based access, team-scoped visibility, conditional policies that combine multiple attributes. This is ABAC territory.
 
-| Change | Risk | Mitigation | Propagation |
-|---|---|---|---|
-| Entitlement revocation / policy change | Revoked user can still query for TTL window | OPA + OPAL push (~1-2s) | Push |
-| Tenant off-boarding | Queries still served for deactivated tenant | Event bus + hard block (immediate) | Push |
+**OPA** (Open Policy Agent) is the right fit. Policies written in Rego — a declarative language purpose-built for authorization. Evaluated in-process via the Go SDK (`opa.Eval()`, sub-millisecond, no network call). CNCF graduated and battle-tested (Netflix, Goldman Sachs, Atlassian). The complexity delta over a custom Go function is small, and Rego handles rich ABAC rules without rewriting the auth layer as policy needs grow.
 
-**Medium severity (operational):**
+**OPAL** (Open Policy Administration Layer) solves policy distribution. When an admin revokes access in Postgres, OPAL detects the change and pushes the updated policy bundle to all OPA instances within ~1-2 seconds. Without OPAL, policy changes propagate only on TTL-based polling (30-60s) — unacceptable for access revocations at enterprise scale.
 
-| Change | Risk | Mitigation | Propagation |
-|---|---|---|---|
-| Rate limit **decrease** | Old higher limit burns SaaS API quota | Event bus push (~1-2s) | Push |
-| Connector disabled for tenant | Queries succeed against disabled connector | Event bus push (~1-2s) | Push |
+The evolution from embedded OPA SDK (M1) to OPA + OPAL push (M5) is covered in [`docs/EXECUTION_PLAN.md`](../EXECUTION_PLAN.md). The evaluator code and Rego policies never change — only the bundle delivery mechanism evolves.
 
-**Low severity (TTL is sufficient):**
-
-| Change | Risk | Mitigation | Propagation |
-|---|---|---|---|
-| Rate limit increase | Tenant can't use higher quota for 60s | No harm; fails conservatively | TTL pull |
-| New connector enabled | Queries fail with "not found" for 60s | Fails closed; safe | TTL pull |
-| Schema / capability change | Suboptimal query plan for 60s | Connector errors handled gracefully | TTL pull |
-
-**Residual risk accepted**: For push events, ~1-2s propagation window remains. Mitigated by: (a) audit log captures all access including during the window, (b) synchronous policy check available as per-tenant toggle for zero-window revocation customers.
-
----
-
-## Entitlement / Authorization Evolution
-
-The auth system progresses through 4 stages. Each earns its complexity.
-
-### Step 1 — Prototype / MVP (Month 1)
-- Gateway validates JWT (HMAC-SHA256)
-- `policy.yaml` loaded from disk at startup into a Go struct
-- Embedded `entitlements.Engine` evaluates RLS/CLS in-process
-- Zero external dependencies for auth
-
-### Step 2 — Policies move to Postgres (Month 2-3)
-- Same embedded engine, same evaluation logic
-- Policy source changes from YAML file to Postgres table
-- Admin API to create/update policies per tenant without redeploying
-- Data plane loads policies at startup + refreshes on 30-60s TTL
-- JWT validation moves to OIDC (verify against IdP JWKS endpoint)
-
-### Step 3 — OPA SDK Embedded (Month 3-4)
-- Replace custom Go policy engine with OPA's Go SDK (`github.com/open-policy-agent/opa/sdk`)
-- Policies written in Rego instead of custom YAML DSL
-- Still evaluated **in-process** — no sidecar, no network call
-- Why: Rego handles complex conditional policies (time-based, attribute-based, team-scoped). Security teams know Rego.
-- Key: Rego policies written here don't change when moving to Step 4.
-
-### Step 4 — OPA Sidecar + OPAL (Month 5-6)
-- OPA moves from embedded SDK to sidecar (or daemonset) per data plane pod
-- OPAL server added to control plane — watches policy store, pushes deltas to all OPA instances
-- Push-based invalidation for access revocations (~1-2s)
-- This is the "regulated enterprise with 50+ tenants and strict revocation SLAs" stage
-
-#### How OPAL Propagation Works
+### How OPAL Propagation Works
 
 ```
 Admin revokes access (Postgres write)
@@ -200,38 +166,7 @@ Admin revokes access (Postgres write)
           → {"result": true}  or  {"result": false}
 ```
 
-OPA is queried **per-request at plan time** for a binary table allow/deny. It is not involved in column masking or row filtering — those are applied by the executor post-fetch (see data-plane-design.md).
-
-#### Bundle Structure — Lean Bundle (Rules Only)
-
-The OPA bundle contains **only Rego policy files**. It never contains user rosters, role assignments, or row-level data.
-
-- **In bundle**: Rego rules per tenant (e.g., `data.authz.allow` checks `input.user.roles`)
-- **Not in bundle**: user→role mappings, tenant→user lists, row-level data
-- **At evaluation time**: user context (`{user_id, tenant_id, roles}`) is passed as `input` — injected per request from the validated JWT, not loaded into the bundle
-
-**Why**: Loading user-level data into the bundle would scale with user count (10M users × role assignments = GBs). Rules stay small regardless of user count; context is injected per request.
-
-**Key invariant**: If someone proposes adding a user roster or permission table to the OPAL bundle, reject it. That data belongs in Postgres, queried at plan time, passed as `input`.
-
-#### OPA Sidecar Resource Sizing
-
-| Parameter | Value | Rationale |
-|---|---|---|
-| Memory limit | 256 MB | Lean bundle (rules only); 100s of tenants × small Rego files |
-| CPU limit | 200m | Policy evaluation is CPU-light at 1k QPS |
-| Max bundle size | 50 MB compressed | OPAL rejects oversized bundles before pushing |
-| Bundle reload | Delta patching | OPAL pushes only changed tenant policies, not the full bundle |
-
-### When to move to the next step
-
-| Step | Trigger | Gain |
-|---|---|---|
-| 1 → 2 | Second tenant onboards with different policies | Per-tenant policies without redeploy |
-| 2 → 3 | Policy rules get conditional/complex, or security audit | Standard policy language (Rego), composable rules |
-| 3 → 4 | Enough data plane nodes that TTL staleness is a compliance concern | Real-time policy propagation, sub-second revocation |
-
-**Honest assessment**: Most startups never get past Step 2. OPA SDK is worth it if policy complexity grows. OPAL is worth it for enterprises with strict revocation SLAs (SOC2 Type II, FedRAMP).
+OPA is queried **per-request at plan time** for a binary table allow/deny. The input is the JWT claims (`user_id`, `tenant_id`, `roles`) — no runtime enrichment, no extra data fetching. Column masking and row filtering are not OPA's concern — those are applied by the executor post-fetch (see [`docs/data-plane/executor.md`](../data-plane/executor.md)).
 
 ---
 

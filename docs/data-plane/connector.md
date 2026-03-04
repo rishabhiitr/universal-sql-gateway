@@ -17,7 +17,7 @@ The most consequential design choice for connectors is where they run relative t
 
 ### Decision: In-Process with Bulkhead Isolation
 
-We run connectors in-process. The core reason: in a federated query engine, the process that calls the connector also joins the results. Separating them means serializing the full result set, sending it over the network, and deserializing it — only to then join it. For a join of 10K × 10K rows, the network transfer dominates the join cost. Trino, Presto, and Dremio all make the same call.
+We run connectors in-process. The core reason: in a federated query engine, the process that calls the connector also joins the results. Separating them means serializing the full result set, sending it over the network, and deserializing it — only to then join it. For a join of 10K × 10K rows, the network transfer dominates the join cost.
 
 The in-process cons (panic propagation, memory contention, no independent scaling) are real but addressable without paying the serialization tax. We address them with bulkhead isolation patterns described in the next section.
 

@@ -181,12 +181,3 @@ The control plane bundle endpoint (`/internal/bundles/policy.tar.gz`) is ~200 li
 
 ---
 
-## Budget
-
-### Infrastructure (AWS)
-
-| Phase | Monthly | Notes |
-|---|---|---|
-| M1–2 | ~$2,000–3,000 | EKS Fargate, MSK (audit pipeline from M2), KMS |
-| M3–4 | ~$6,000–10,000 | Redis cluster, staging environment, control plane DB |
-| M5–6 | ~$12,000–20,000 | Production cluster, OPAL server, managed CD, multi-AZ |
