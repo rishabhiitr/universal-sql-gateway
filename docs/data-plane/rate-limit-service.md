@@ -729,24 +729,6 @@ On denial, the span includes `retry_after_seconds` and `budget.*` attributes, ma
 
 ---
 
-## Prototype vs Production Gap
-
-| Aspect | Prototype (current) | Production design |
-|---|---|---|
-| **Key dimensions** | `tenant:connector` (2D) | `tenant`, `tenant:user`, `tenant:connector`, `tenant:user:connector` (4D) |
-| **Limiter type** | Token bucket only | Token bucket + semaphore + composite, selected by connector capability |
-| **Burst** | Always allowed | Only for connectors that declare `model: token_bucket` |
-| **State sharing** | In-process (`sync.RWMutex`) | Redis-backed for all levels (L1–L4) across all pods |
-| **User fairness** | Not enforced | L2 + L4 ensure no single user starves others |
-| **Cache interaction** | Token consumed even on cache hit | Reservation pattern — cancel on cache hit |
-| **Async overflow** | Not implemented | On L3/L4 denial, eligible queries routed to async job queue |
-| **Adaptive limits** | Static config only | Reads SaaS response headers to recalibrate budget |
-| **Release semantics** | No release (token bucket only) | `Release()` for concurrency semaphore connectors |
-| **Redis fallback** | N/A (single node) | Local state with conservative per-pod allocation |
-| **Observability** | Basic allowed/denied in response | Prometheus metrics, OTel spans, alerts |
-
----
-
 ## Summary
 
 | Design Decision | Rationale |

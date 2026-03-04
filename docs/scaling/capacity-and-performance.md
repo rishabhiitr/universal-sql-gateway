@@ -97,16 +97,6 @@ maxReplicas: 20
 
 Pod cold-start time is ~3 s (config cache pre-warmed from Redis on init). This is fast enough for traffic bursts — HPA can add a pod before a 5 s query timeout fires.
 
-### Connector Worker Pods (Out-of-Process Topology)
-
-Applicable only if the connector pool is deployed as separate sidecar or worker pods (see `docs/data-plane-design.md §2`). In the default in-process topology, connector workers scale with the executor pod.
-
-```
-Scale metric: Kafka consumer lag per connector topic
-Scale out:    lag > 100 messages for 30 s
-Scale to zero: lag = 0 for 10 min (off-hours cost saving)
-```
-
 ### Redis Cache (ElastiCache)
 
 No autoscaling. Redis is vertically scaled and sized for the working set (≤1 GB initially). Cache misses degrade gracefully to live fetch — they don't cause errors, just higher latency and load.

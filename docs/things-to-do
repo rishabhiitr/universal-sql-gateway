@@ -113,3 +113,21 @@ If the result size is smaller it can be stored in a blob / cache ? And served to
 
 
 
+
+
+
+
+we can add what infra components are added till now.
+
+What the developer is working
+
+
+No CI/CD in month 2, we deploy manually. We have ELB,
+
+just one O AUth in month 1
+
+
+
+
+
+
