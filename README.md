@@ -15,7 +15,7 @@ Cross-app federated SQL query layer for enterprise SaaS applications. Users writ
 > These trade-offs assume the end-to-end production design described in the deep-dive docs below and the [six-month execution plan](docs/EXECUTION_PLAN.md). The prototype demonstrates the core query path; the trade-offs below reflect the design decisions that would govern the system at scale.
 
 ### 1. Tenant-Scoped Fetch Cache + Post-Fetch RLS — vs Per-User Cache
-Cache is keyed on `(tenant, connector, table, pushed_filters)`, not per-user. The cache intentionally holds data individual users may not see — RLS/CLS filters are applied locally on read, same model as Postgres RLS. **Give**: cache stores rows the requesting user might not be authorized for. **Get**: 1 cache entry serves 10K users → ~70-80% hit rate instead of ~5%, avoids rate-limit exhaustion. See [freshness-and-caching.md](docs/data-plane/freshness-and-caching.md).
+Cache is keyed on `(tenant, connector, table, pushed_filters)`, not per-user. The cache intentionally holds data individual users may not see — RLS/CLS filters are applied locally on read, same model as Postgres RLS. **Give**: cache stores rows the requesting user might not be authorized for. **Get**: 1 cache entry serves 10K users → ~70-80% hit rate instead of ~5%, avoids rate-limit exhaustion, and avoids key-space explosion — a per-user or per-query cache would produce O(users × queries) keys, making eviction, memory sizing, and invalidation unmanageable at 10M users. See [freshness-and-caching.md](docs/data-plane/freshness-and-caching.md).
 
 ### 2. In-Process Connectors + Bulkhead Isolation — vs Out-of-Process Microservices
 Connectors run in the same Go binary with goroutine pools, memory budgets, circuit breakers, and panic recovery. **Give**: a misbehaving connector can theoretically affect the process (mitigated by bulkheads). **Get**: eliminates ~80ms serialization overhead per join leg (16% of 500ms P50 budget). Every production federated engine (Trino, Presto, DuckDB) runs connectors in-process. Out-of-process justified only for untrusted code or different language runtimes. See [data-plane.md §2](docs/data-plane/data-plane.md).
@@ -124,13 +124,21 @@ Response includes `rows`, `columns`, `freshness_ms`, `cache_hit`, `rate_limit_st
 
 ---
 
-### Load test (k6)
+### Load test
+
+No extra tools needed — runs with the Go toolchain already required for the project.
 
 ```bash
-k6 run tests/load/query_load_test.js
+go run tests/load/main.go
 ```
 
-Runs ~500-1k QPS for 60s and reports P50/P95 latency.
+Optional flags:
+
+```bash
+go run tests/load/main.go -url http://localhost:8080 -duration 60s -max-vus 500 -start-vus 25
+```
+
+Tokens (admin / developer / viewer) are generated inside the script using the same `JWT_SECRET` env var as the gateway (defaults to `dev-secret`). Ramps from 25 → 500 VUs over 60s, then reports P50/P95/P99 latency, QPS, cache-hit rate, and rate-limit hits. Exits non-zero if P95 > 1500ms or error rate > 1%.
 
 ---
 

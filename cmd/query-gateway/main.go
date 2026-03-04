@@ -57,8 +57,16 @@ func main() {
 	limiter := ratelimit.New(
 		ratelimit.Config{RatePerSecond: 20, Burst: 40},
 		map[string]ratelimit.Config{
-			"github": {RatePerSecond: 2, Burst: 2}, // demo: 2 tokens max, 2 pass and 18 throttled in burst test
+			"github": {RatePerSecond: 2, Burst: 2}, // demo: tight limits so burst scenario triggers 429s
 			"jira":   {RatePerSecond: 8, Burst: 16},
+		},
+		map[string]map[string]ratelimit.Config{
+			// t-load: high-throughput tenant used by the load test — relaxed per-connector limits
+			// so the test measures gateway/planner latency, not rate-limit rejections.
+			"t-load": {
+				"github": {RatePerSecond: 500, Burst: 1000},
+				"jira":   {RatePerSecond: 500, Burst: 1000},
+			},
 		},
 	)
 	entitlementEngine := entitlements.NewEngine(policy)

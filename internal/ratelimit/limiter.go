@@ -17,17 +17,19 @@ type Config struct {
 }
 
 type Service struct {
-	mu         sync.RWMutex
-	buckets    map[string]*rate.Limiter
-	configs    map[string]Config
-	defaultCfg Config
+	mu              sync.RWMutex
+	buckets         map[string]*rate.Limiter
+	configs         map[string]Config
+	tenantOverrides map[string]map[string]Config // tenantID → connectorID → Config
+	defaultCfg      Config
 }
 
-func New(defaultCfg Config, connectorCfg map[string]Config) *Service {
+func New(defaultCfg Config, connectorCfg map[string]Config, tenantOverrides map[string]map[string]Config) *Service {
 	return &Service{
-		buckets:    make(map[string]*rate.Limiter),
-		configs:    connectorCfg,
-		defaultCfg: defaultCfg,
+		buckets:         make(map[string]*rate.Limiter),
+		configs:         connectorCfg,
+		tenantOverrides: tenantOverrides,
+		defaultCfg:      defaultCfg,
 	}
 }
 
@@ -79,6 +81,12 @@ func (s *Service) getOrCreateLimiter(tenantID, connectorID string) *rate.Limiter
 	cfg := s.defaultCfg
 	if override, found := s.configs[connectorID]; found {
 		cfg = override
+	}
+	// Per-tenant overrides take precedence over connector defaults.
+	if tenantCfg, ok := s.tenantOverrides[tenantID]; ok {
+		if override, found := tenantCfg[connectorID]; found {
+			cfg = override
+		}
 	}
 
 	s.mu.Lock()
