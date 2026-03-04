@@ -147,10 +147,3 @@ Minimal expectations: entitlement enforcement, rate-limit handling, and a freshn
 **Bonus**: cost levers, chaos plan, predicate pushdown creativity.
 
 ---
-
-## Working Agreements
-
-- **Scenario chosen**: GitHub <-> Jira (PRs <-> issues)
-- **Language**: Go
-- **Prototype is built** — see `docs/IMPLEMENTATION_PLAN.md` for the build order
-- **Remaining deliverables**: Design Doc (`docs/DESIGN.md`), Execution Plan (`docs/EXECUTION_PLAN.md`), observability screenshots

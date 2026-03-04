@@ -57,7 +57,7 @@ func main() {
 	limiter := ratelimit.New(
 		ratelimit.Config{RatePerSecond: 20, Burst: 40},
 		map[string]ratelimit.Config{
-			"github": {RatePerSecond: 8, Burst: 4}, // demo-friendly burst - set higher in production
+			"github": {RatePerSecond: 2, Burst: 2}, // demo: 2 tokens max, 2 pass and 18 throttled in burst test
 			"jira":   {RatePerSecond: 8, Burst: 16},
 		},
 	)

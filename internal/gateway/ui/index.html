@@ -146,7 +146,7 @@
       { id: "cache_hit", group: "freshnessButtons", label: "Cache hit", token: "alice", staleness: 60000, sql: SQL.join, desc: "Auto-runs twice with 500ms gap. First should miss cache, second should hit.", run: "double" },
       { id: "stale_cached", group: "freshnessButtons", label: "Staleness (cached)", token: "alice", staleness: 60000, sql: SQL.join, desc: "Allows staleness so cached response can be served.", note: "Data is mocked. cache_hit and freshness_ms prove real cache behavior.", run: "single" },
       { id: "force_live", group: "freshnessButtons", label: "Staleness (force live)", token: "alice", staleness: 0, sql: SQL.join, desc: "max_staleness_ms=0 forces live connector fetch.", note: "Data is mocked. cache_hit and freshness_ms prove real cache behavior.", run: "single" },
-      { id: "burst", group: "systemButtons", label: "Rate limit burst", token: "alice", staleness: 0, sql: SQL.join, desc: "Sends 20 parallel requests. With github burst=4, several should return RATE_LIMIT_EXHAUSTED.", run: "burst" },
+      { id: "burst", group: "systemButtons", label: "Rate limit burst", token: "alice", staleness: 0, sql: SQL.join, desc: "Sends 20 parallel requests against github (burst=2, rate=2/s). All 20 arrive simultaneously — only 2 tokens are available, so expect 2 OK and 18 RATE_LIMIT_EXHAUSTED with Retry-After guidance.", run: "burst" },
       { id: "github_only", group: "systemButtons", label: "GitHub-only query", token: "alice", staleness: 0, sql: SQL.githubOnly, desc: "Single-source query: sources should only include github due to pushdown.", run: "single" }
     ];
 

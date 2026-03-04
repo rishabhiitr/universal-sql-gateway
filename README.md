@@ -1,6 +1,69 @@
 # Universal SQL Gateway
 
-Cross-app federated SQL query layer for enterprise SaaS applications.
+Cross-app federated SQL query layer for enterprise SaaS applications. Users write a single SQL SELECT — the system handles federation across SaaS APIs, entitlement enforcement (RLS/CLS), rate-limit compliance, and freshness control transparently.
+
+**Prototype scenario**: GitHub Pull Requests ↔ Jira Issues — cross-app JOIN with entitlements, rate limiting, and cache-aware freshness.
+
+## Architecture
+
+![High-Level Architecture](docs/query-federator-hla.png)
+
+---
+
+## Key Trade-offs
+
+> These trade-offs assume the end-to-end production design described in the deep-dive docs below and the [six-month execution plan](docs/EXECUTION_PLAN.md). The prototype demonstrates the core query path; the trade-offs below reflect the design decisions that would govern the system at scale.
+
+### 1. Tenant-Scoped Fetch Cache + Post-Fetch RLS — vs Per-User Cache
+Cache is keyed on `(tenant, connector, table, pushed_filters)`, not per-user. The cache intentionally holds data individual users may not see — RLS/CLS filters are applied locally on read, same model as Postgres RLS. **Give**: cache stores rows the requesting user might not be authorized for. **Get**: 1 cache entry serves 10K users → ~70-80% hit rate instead of ~5%, avoids rate-limit exhaustion. See [freshness-and-caching.md](docs/data-plane/freshness-and-caching.md).
+
+### 2. In-Process Connectors + Bulkhead Isolation — vs Out-of-Process Microservices
+Connectors run in the same Go binary with goroutine pools, memory budgets, circuit breakers, and panic recovery. **Give**: a misbehaving connector can theoretically affect the process (mitigated by bulkheads). **Get**: eliminates ~80ms serialization overhead per join leg (16% of 500ms P50 budget). Every production federated engine (Trino, Presto, DuckDB) runs connectors in-process. Out-of-process justified only for untrusted code or different language runtimes. See [data-plane.md §2](docs/data-plane/data-plane.md).
+
+### 3. Freshness Floor + Live-Fetch Budget + Graceful Degradation — vs Honoring max_staleness=0
+`max_staleness=0` is clamped to a per-connector floor (e.g., 30s). Live fetches are gated by a per-tenant token bucket. When budget is exhausted, stale cache is served with `CACHE_FORCED` transparency — not an error. **Give**: clients cannot guarantee perfectly fresh data. **Get**: one tenant's freshness demand cannot burn rate-limit budget for all tenants sharing the same OAuth token. See [freshness-and-caching.md §5](docs/data-plane/freshness-and-caching.md).
+
+### 4. Federated On-The-Fly Join + Size-Triggered S3 Materialization — vs Frequency-Based Materialization
+Default is in-memory hash join (build on smaller side). When memory budget is exceeded, DuckDB handles disk-backed execution. Join results are materialized to S3 **only when the result exceeds a size threshold** (~1MB) — no frequency counter or hit-rate tracking. **Give**: repeated small-to-medium joins recompute each time (source cache eliminates the costly part — SaaS API calls — so the join itself is <10ms on warm cache). **Get**: no counter-tracking infrastructure, no threshold tuning, no race conditions on threshold crossing — and zero compliance surface for small results. See [freshness-and-caching.md §Materialization](docs/data-plane/freshness-and-caching.md).
+
+### 5. OPAL Push for Policy Revocation — vs TTL-Only Propagation
+Security-critical changes (entitlement revocation, tenant off-boarding) propagate via OPAL push in ~1-2s. Low-severity changes (new connectors, schema updates) use 30-60s TTL pull. **Give**: OPAL server, sidecar per pod, event bus dependency — real operational complexity. **Get**: revoked user's query window shrinks from 60s to ~1-2s. Most systems accept the TTL window; we chose not to for enterprises with strict revocation SLAs. See [control-plane.md §3.2](docs/control-plane/control-plane.md).
+
+---
+
+## Docs
+
+### Start here
+| Doc | What it covers |
+|---|---|
+| [EXECUTION_PLAN.md](docs/EXECUTION_PLAN.md) | Six-month roadmap — team shape, milestones, acceptance criteria, risk register |
+
+### Data Plane
+| Doc | What it covers |
+|---|---|
+| [data-plane.md](docs/data-plane/data-plane.md) | Component map, planner internals, sync/async paths, end-to-end query trace |
+| **[freshness-and-caching.md](docs/data-plane/freshness-and-caching.md)** | **The hardest design surface** — predicate pushdown decisions, tenant-scoped fetch cache, TTL + ETag/conditional fetch, materialization triggers, staleness contracts |
+| [rate-limit-service.md](docs/data-plane/rate-limit-service.md) | Token bucket design, per-tenant/connector/user fairness, async overflow path |
+| [connector.md](docs/data-plane/connector.md) | Connector SDK interface, runtime isolation, bulkhead patterns, auth/token refresh |
+| [executor.md](docs/data-plane/executor.md) | Entitlement enforcement (OPA/OPAL), RLS/CLS application, join execution, spill strategy |
+
+### Control Plane
+| Doc | What it covers |
+|---|---|
+| [control-plane.md](docs/control-plane/control-plane.md) | Tenant/connector registry, schema catalog, policy propagation (OPAL push vs TTL pull), Postgres schema |
+
+### Security & Compliance
+| Doc | What it covers |
+|---|---|
+| [security-design-notes.md](docs/security/security-design-notes.md) | STRIDE threat model, mTLS, per-tenant KMS, audit pipeline, crypto-shredding, data residency |
+
+### Scale & Operations
+| Doc | What it covers |
+|---|---|
+| [capacity-and-performance.md](docs/scaling/capacity-and-performance.md) | Autoscaling policies, overload protection, backpressure, load test plan |
+| [deployment-strategy.md](docs/deployment-strategy.md) | Terraform modules, Helm/k8s, canary/blue-green, multi-tenant vs single-tenant deployment |
+
+---
 
 ## Quickstart
 
@@ -67,26 +130,17 @@ Response includes `rows`, `columns`, `freshness_ms`, `cache_hit`, `rate_limit_st
 k6 run tests/load/query_load_test.js
 ```
 
-Runs ~500–1k QPS for 60s and reports P50/P95 latency.
+Runs ~500-1k QPS for 60s and reports P50/P95 latency.
 
-## 🔑 Key Trade-offs
+---
 
+### Observability
 
-### 1. Tenant-Scoped Fetch Cache + Post-Fetch RLS — vs Per-User Cache
-Cache is keyed on `(tenant, connector, table, pushed_filters)`, not per-user. The cache intentionally holds data individual users may not see — RLS/CLS filters are applied locally on read, same model as Postgres RLS. **Give**: cache stores rows the requesting user might not be authorized for. **Get**: 1 cache entry serves 10K users → ~70-80% hit rate instead of ~5%, avoids rate-limit exhaustion. See [data-storage-and-cache-strategy.md](docs/data-storage-and-cache-strategy.md).
+**Traces** — Open [Jaeger UI](http://localhost:16686), select service `query-gateway`. Each trace shows the full query path: parse → plan → concurrent connector fetches → join → RLS/CLS → response.
 
+**Metrics** — Open [Prometheus UI](http://localhost:9090/graph) and paste any of these (run a few demo queries from the UI first):
 
-### 2. In-Process Connectors + Bulkhead Isolation — vs Out-of-Process Microservices
-Connectors run in the same Go binary with goroutine pools, memory budgets, circuit breakers, and panic recovery. **Give**: a misbehaving connector can theoretically affect the process (mitigated by bulkheads). **Get**: eliminates ~80ms serialization overhead per join leg (16% of 500ms P50 budget). Every federated engine at this scale (Trino, Presto, DuckDB) does in-process. Out-of-process justified only for untrusted code or different language runtimes. See [data-plane-design.md §2](docs/data-plane-design.md).
-
-
-### 3. Freshness Floor + Live-Fetch Budget + Graceful Degradation — vs Honoring max_staleness=0
-`max_staleness=0` is clamped to a per-connector floor (e.g., 30s). Live fetches are gated by a per-tenant token bucket. When budget is exhausted, stale cache is served with `CACHE_FORCED` transparency — not an error. **Give**: clients cannot guarantee perfectly fresh data. **Get**: one tenant's freshness demand cannot burn rate-limit budget for all tenants sharing the same OAuth token. See [data-storage-and-cache-strategy.md §5](docs/data-storage-and-cache-strategy.md).
-
-
-### 4. Federated On-The-Fly Join + Size-Triggered S3 Materialization — vs Frequency-Based Materialization
-Default is in-memory hash join (build on smaller side). When memory budget is exceeded, DuckDB handles disk-backed execution. Join results are materialized to S3 **only when the result exceeds a size threshold** (~1MB) — there is no frequency counter or hit-rate tracking. **Give**: repeated small-to-medium joins recompute each time (source cache eliminates the costly part — SaaS API calls — so the join itself is <10ms on warm cache). **Get**: no counter-tracking infrastructure, no threshold tuning, no race conditions on threshold crossing — and zero compliance surface for small results. Large results (100K+ rows per side) are the only ones worth persisting, and the size of the result itself is an unambiguous trigger that needs no coordination. See [freshness-and-caching.md §Materialization](docs/data-plane/freshness-and-caching.md).
-
-
-### 5. OPAL Push for Policy Revocation — vs TTL-Only Propagation
-Security-critical changes (entitlement revocation, tenant off-boarding) propagate via OPAL push in ~1-2s. Low-severity changes (new connectors, schema updates) use 30-60s TTL pull. **Give**: OPAL server, sidecar per pod, event bus dependency — real operational complexity. **Get**: revoked user's query window shrinks from 60s to ~1-2s. Most systems accept the TTL window; we chose not to for enterprises with strict revocation SLAs. See [control-plane-design-notes.md §3.2](docs/control-plane-design-notes.md).
+| What | PromQL |
+|---|---|
+| Requests by status (200/429) | `query_gateway_requests_total{path="/v1/query"}` |
+| Latency histogram | `query_gateway_request_duration_seconds_bucket{path="/v1/query"}` |
