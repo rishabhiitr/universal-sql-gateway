@@ -1,0 +1,32 @@
+services:
+  query-gateway:
+    build:
+      context: ../..
+      dockerfile: deployment/docker/Dockerfile
+    container_name: query-gateway
+    environment:
+      - HTTP_ADDR=:8080
+      - JWT_SECRET=dev-secret
+      - POLICY_PATH=/configs/policy.yaml
+    ports:
+      - "8080:8080"
+    depends_on:
+      - jaeger
+      - prometheus
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.58
+    container_name: jaeger
+    ports:
+      - "16686:16686"
+      - "4318:4318"
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+    volumes:
+      - ../../observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"

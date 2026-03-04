@@ -1,0 +1,30 @@
+tables:
+  github.pull_requests:
+    allowed_roles:
+      - admin
+      - developer
+      - viewer
+    row_filters:
+      - role: developer
+        column: author
+        principal_field: username
+    column_masks:
+      email:
+        except_roles:
+          - admin
+        mask: "[REDACTED]"
+
+  jira.issues:
+    allowed_roles:
+      - admin
+      - developer
+      - viewer
+    row_filters:
+      - role: developer
+        column: assignee
+        principal_field: username
+    column_masks:
+      assignee_email:
+        except_roles:
+          - admin
+        mask: "[REDACTED]"

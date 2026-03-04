@@ -1,0 +1,115 @@
+
+
+1. Figure out how end to end authentication works
+
+
+2. Figure out how end to end authorization works
+
+
+
+3. Data plane connector schema
+
+S3, Parquet Materialization
+
+Query Federation on the fly
+
+
+
+
+Connector SDK Design
+
+
+Connector Interface
+
+
+What is the role of parser and how does it interact with the connector interface
+
+Query parser parses the query, figures out the connectors and pushes down the individual 
+connector queries to each connector, aggregate results and then return the result. 
+
+
+
+
+
+
+What is the data plane
+
+
+Authentication,
+
+Rate Limit Check ( already delegated)
+
+Query Parsing ( might be CPU intensive ??? need to check )
+
+
+Connector Service ()  ( connector metadata caching)
+
+ rate limit per connector,
+ no of tables per connector
+ auth token per connector->
+
+ Dedicated Connection Pools per connector
+
+Golang Service is there -> hence threads hanging for a slow connector should not be a problem here
+
+We can potentially have connector tiering going forward (if its justified)
+Need to properly discuss how do we prevent one connector hogging resources
+
+connection level isolation
+bulk heading level isolation
+What about memory -> (how do we protect memory), Can we have memory level isolation. What if some connector
+brings very large payloads in memory which creates noisy neighbour problems.
+
+I do think some sort of connector level service url can be eventually created and all sort of caching the data
+and the S3 Access and parquet files can be pushed down here.
+
+
+How do we handle the async path of the query here ->
+
+
+Kubernetes pod registry. What I think is we can have a connector registry, where admins can possibly configure what is the compute size of each connector
+, what is the URL of each connector . What is the memory config of each connector and so on.
+
+and hence being able to scale. We will all the metrics on a connector level, everything is schedule in a kubernetes pod I guess.
+The kubernetes pod tenant framework should be able to handle this, and whenever i make a change in the core connector frame work
+this should be able to deploy to all the available connector kube pod group.
+
+
+We are not going to have isolation at the connector, tenant Id level as at that level the design simply explodes.
+
+Do we hve thread pool and connection pool at the tenant level ? I think so that should be possible. That is another configuration in the
+control plane. Although this is go service so threads should not be an issue, but possibly we can have a compute defined
+basis of the throughput which is allowed for the each tenant for a connector. Some tenants which have bigger connector quota will have
+bigger thread pools. We will have the pod size basis the largets tenant connector config.
+
+
+Now coming to the data storage in the data plane->
+
+We have a redis which will store the query cache (with lesser predicates)
+
+This redis will be shared by the connectors and the data plane
+
+
+Now it comes to how does the query planner work with connectors _.
+
+Lets talk about the normal case where the no of results are less only. This is the most critical part ->
+
+Each of the connector shares the results and the query planner applies the filter, RLS and TLS criteria.
+Possibly RLS and TLS if possibly can be pushed to the connector itself (wherever possible I guess)
+
+On thinking again pushing down to the connector we might not do, is because we dont want to keep the same connector code
+at two places. So we will absort the one more layer of network transfer at the cost of keeping the filter code at the same level ? 
+
+
+What about the cases where we need a parquet storage ? So i guess connector will write the parquet or to the S3
+Ultimately, what will happen is the query planner will run whatever is required compute the results
+
+and this can be potentially served via an async path or sync path based on the no of results
+
+if the result size is too big we possibly need a S3 link. The clients can be served via a S3 file
+If the result size is smaller it can be stored in a blob / cache ? And served to the clients.
+
+
+
+
+

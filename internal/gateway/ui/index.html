@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Universal SQL Query UI</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    body {
+      margin: 0;
+      background: #0b1020;
+      color: #e5e7eb;
+    }
+    .container {
+      max-width: 1000px;
+      margin: 24px auto;
+      padding: 0 16px;
+    }
+    .card {
+      background: #121a31;
+      border: 1px solid #22305f;
+      border-radius: 10px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 1.4rem;
+    }
+    .muted {
+      color: #9ca3af;
+      margin: 0 0 10px;
+      font-size: 0.9rem;
+    }
+    label {
+      display: block;
+      margin-top: 10px;
+      margin-bottom: 6px;
+      font-weight: 600;
+    }
+    input, textarea, button {
+      width: 100%;
+      box-sizing: border-box;
+      border-radius: 8px;
+      border: 1px solid #31457f;
+      background: #0d1530;
+      color: #e5e7eb;
+      padding: 10px;
+      font: inherit;
+    }
+    textarea {
+      min-height: 130px;
+      resize: vertical;
+      line-height: 1.4;
+    }
+    .grid {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: 2fr 1fr;
+    }
+    @media (max-width: 768px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+    .btn {
+      cursor: pointer;
+      border: none;
+      background: #3b82f6;
+      font-weight: 700;
+      margin-top: 12px;
+    }
+    .btn:disabled {
+      opacity: 0.6;
+      cursor: wait;
+    }
+    .status {
+      margin: 0;
+      font-size: 0.92rem;
+      color: #cbd5e1;
+    }
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .table-wrap {
+      overflow: auto;
+      border: 1px solid #31457f;
+      border-radius: 8px;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      min-width: 560px;
+    }
+    th, td {
+      padding: 8px 10px;
+      border-bottom: 1px solid #22305f;
+      text-align: left;
+      font-size: 0.9rem;
+      vertical-align: top;
+    }
+    pre {
+      margin: 0;
+      padding: 12px;
+      border-radius: 8px;
+      background: #0d1530;
+      border: 1px solid #31457f;
+      overflow: auto;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <h1>Universal SQL Query UI</h1>
+      <p class="muted">Run SQL against <span class="mono">/v1/query</span> with a bearer token.</p>
+      <div class="grid">
+        <div>
+          <label for="token">Bearer token (JWT)</label>
+          <input id="token" placeholder="Paste JWT token here" />
+        </div>
+        <div>
+          <label for="staleness">max_staleness_ms</label>
+          <input id="staleness" type="number" min="0" value="60000" />
+        </div>
+      </div>
+      <label for="sql">SQL</label>
+      <textarea id="sql" class="mono">SELECT gh.title, gh.state, j.issue_key, j.status, j.assignee
+FROM github.pull_requests gh
+JOIN jira.issues j ON gh.jira_issue_id = j.issue_key
+WHERE gh.state = 'open'
+LIMIT 10</textarea>
+      <button id="run" class="btn">Run Query</button>
+    </div>
+
+    <div class="card">
+      <p id="status" class="status">Ready.</p>
+      <div id="tableWrap" class="table-wrap" style="display:none;"></div>
+    </div>
+
+    <div class="card">
+      <label>Raw response</label>
+      <pre id="raw" class="mono">{}</pre>
+    </div>
+  </div>
+
+  <script>
+    const tokenEl = document.getElementById("token");
+    const stalenessEl = document.getElementById("staleness");
+    const sqlEl = document.getElementById("sql");
+    const runBtn = document.getElementById("run");
+    const statusEl = document.getElementById("status");
+    const rawEl = document.getElementById("raw");
+    const tableWrapEl = document.getElementById("tableWrap");
+
+    function setStatus(message) {
+      statusEl.textContent = message;
+    }
+
+    function escapeHTML(value) {
+      return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll("\"", "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    function renderTable(data) {
+      const columns = Array.isArray(data?.columns) ? data.columns : [];
+      const rows = Array.isArray(data?.rows) ? data.rows : [];
+
+      if (columns.length === 0 || rows.length === 0) {
+        tableWrapEl.style.display = "none";
+        tableWrapEl.innerHTML = "";
+        return;
+      }
+
+      const header = columns.map((col) => `<th>${escapeHTML(col.name || "")}</th>`).join("");
+      const body = rows.map((row) => {
+        const cells = columns.map((col) => `<td>${escapeHTML(row?.[col.name] ?? "")}</td>`).join("");
+        return `<tr>${cells}</tr>`;
+      }).join("");
+
+      tableWrapEl.innerHTML = `<table><thead><tr>${header}</tr></thead><tbody>${body}</tbody></table>`;
+      tableWrapEl.style.display = "block";
+    }
+
+    async function runQuery() {
+      const token = tokenEl.value.trim();
+      const sql = sqlEl.value.trim();
+      const maxStaleness = Number(stalenessEl.value || 0);
+
+      if (!token) {
+        setStatus("Token is required.");
+        return;
+      }
+      if (!sql) {
+        setStatus("SQL is required.");
+        return;
+      }
+
+      runBtn.disabled = true;
+      setStatus("Running query...");
+
+      const startedAt = performance.now();
+      try {
+        const response = await fetch("/v1/query", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${token}`
+          },
+          body: JSON.stringify({
+            sql,
+            max_staleness_ms: Number.isFinite(maxStaleness) ? maxStaleness : 0
+          })
+        });
+
+        const payload = await response.json().catch(() => ({}));
+        const elapsed = Math.round(performance.now() - startedAt);
+        const traceId = payload?.trace_id ? ` trace_id=${payload.trace_id}` : "";
+        setStatus(`HTTP ${response.status} in ${elapsed}ms.${traceId}`);
+        rawEl.textContent = JSON.stringify(payload, null, 2);
+        renderTable(payload);
+      } catch (error) {
+        setStatus("Request failed. Check gateway logs.");
+        rawEl.textContent = JSON.stringify({ error: String(error) }, null, 2);
+        tableWrapEl.style.display = "none";
+        tableWrapEl.innerHTML = "";
+      } finally {
+        runBtn.disabled = false;
+      }
+    }
+
+    runBtn.addEventListener("click", runQuery);
+  </script>
+</body>
+</html>
