@@ -135,7 +135,11 @@ func (e *Executor) fetchConcurrent(
 			}
 
 			cacheKey := buildCacheKey(principal.TenantID, source)
-			maxStaleness := time.Duration(req.MaxStalenessMS) * time.Millisecond
+			// nil = no constraint (use cache freely), 0 = force live, >0 = max age in ms
+			maxStaleness := time.Duration(-1) // default: no constraint
+			if req.MaxStalenessMS != nil {
+				maxStaleness = time.Duration(*req.MaxStalenessMS) * time.Millisecond
+			}
 			if cached, staleness, ok := e.cache.Get(cacheKey, maxStaleness); ok {
 				rows := cloneRows(cached.([]models.Row))
 				outCh <- result{

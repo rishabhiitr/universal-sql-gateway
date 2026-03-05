@@ -16,7 +16,7 @@ type Principal struct {
 
 type QueryRequest struct {
 	SQL            string `json:"sql"`
-	MaxStalenessMS int64  `json:"max_staleness_ms,omitempty"`
+	MaxStalenessMS *int64 `json:"max_staleness_ms,omitempty"` // nil = no constraint (use cache), 0 = force live, >0 = max age in ms
 	PageSize       int    `json:"page_size,omitempty"`
 	PageToken      string `json:"page_token,omitempty"`
 }

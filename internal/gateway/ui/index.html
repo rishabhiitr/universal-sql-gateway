@@ -88,8 +88,8 @@
       <div class="card">
         <label for="sql">SQL Editor</label>
         <textarea id="sql" class="mono"></textarea>
-        <label for="staleness">max_staleness_ms</label>
-        <input id="staleness" type="number" min="0" value="0" />
+        <label for="staleness">max_staleness_ms (-1 = use cache, 0 = force live)</label>
+        <input id="staleness" type="number" min="-1" value="-1" />
         <label for="token">Token (readonly)</label>
         <input id="token" class="mono readonly" readonly />
         <button id="run" class="run-btn">Run Query -></button>
@@ -136,6 +136,7 @@
 
     const SQL = {
       join: "SELECT gh.pr_number, gh.title, gh.author, gh.email, j.issue_key, j.assignee, j.assignee_email, j.status\nFROM github.pull_requests gh\nJOIN jira.issues j ON gh.jira_issue_id = j.issue_key\nWHERE gh.state = 'open'\nLIMIT 12",
+      freshness: "SELECT gh.pr_number, gh.title, gh.author, gh._fetched_at, j.issue_key, j.status, j._fetched_at\nFROM github.pull_requests gh\nJOIN jira.issues j ON gh.jira_issue_id = j.issue_key\nWHERE gh.state = 'open'\nLIMIT 5",
       githubOnly: "SELECT gh.pr_number, gh.title, gh.author, gh.email, gh.state\nFROM github.pull_requests gh\nWHERE gh.state = 'open'\nLIMIT 12"
     };
 
@@ -143,9 +144,9 @@
       { id: "cross_join", group: "securityButtons", label: "Cross-app JOIN", token: "alice", staleness: 0, sql: SQL.join, desc: "GitHub PRs join Jira issues. Admin user sees all rows.", run: "single" },
       { id: "rls", group: "securityButtons", label: "RLS (developer)", token: "bob", staleness: 0, sql: SQL.join, desc: "Same SQL with developer role. Row-level filters restrict to bob-owned records.", run: "single" },
       { id: "cls", group: "securityButtons", label: "CLS (masked email)", token: "charlie", staleness: 0, sql: SQL.join, desc: "Viewer role has column masking on email fields, highlighted in amber.", run: "single" },
-      { id: "cache_hit", group: "freshnessButtons", label: "Cache hit", token: "alice", staleness: 60000, sql: SQL.join, desc: "Auto-runs twice with 500ms gap. First should miss cache, second should hit.", run: "double" },
-      { id: "stale_cached", group: "freshnessButtons", label: "Staleness (cached)", token: "alice", staleness: 60000, sql: SQL.join, desc: "Allows staleness so cached response can be served.", note: "Data is mocked. cache_hit and freshness_ms prove real cache behavior.", run: "single" },
-      { id: "force_live", group: "freshnessButtons", label: "Staleness (force live)", token: "alice", staleness: 0, sql: SQL.join, desc: "max_staleness_ms=0 forces live connector fetch.", note: "Data is mocked. cache_hit and freshness_ms prove real cache behavior.", run: "single" },
+      { id: "cache_hit", group: "freshnessButtons", label: "Cache hit", token: "alice", staleness: 60000, sql: SQL.freshness, desc: "Auto-runs twice with 500ms gap. First should miss cache, second should hit. Notice _fetched_at is identical in both runs.", run: "double" },
+      { id: "stale_cached", group: "freshnessButtons", label: "Staleness (cached)", token: "alice", staleness: -1, sql: SQL.freshness, desc: "max_staleness_ms=-1 (no constraint) — serves from cache. Compare with 'force live': cache_hit=true, freshness_ms > 0, and _fetched_at stays frozen at the original fetch time.", note: "Run this after any query to see a cache hit. Then run 'force live' — _fetched_at will change, proving a fresh fetch.", run: "single" },
+      { id: "force_live", group: "freshnessButtons", label: "Staleness (force live)", token: "alice", staleness: 0, sql: SQL.freshness, desc: "max_staleness_ms=0 — bypasses cache, fetches live from connectors. Compare with 'cached': cache_hit=false, freshness_ms=0, and _fetched_at updates to now.", note: "Run 'cached' first, then this. The _fetched_at timestamp changes, proving the cache was bypassed.", run: "single" },
       { id: "burst", group: "systemButtons", label: "Rate limit burst", token: "alice", staleness: 0, sql: SQL.join, desc: "Sends 20 parallel requests against github (burst=2, rate=2/s). All 20 arrive simultaneously — only 2 tokens are available, so expect 2 OK and 18 RATE_LIMIT_EXHAUSTED with Retry-After guidance.", run: "burst" },
       { id: "github_only", group: "systemButtons", label: "GitHub-only query", token: "alice", staleness: 0, sql: SQL.githubOnly, desc: "Single-source query: sources should only include github due to pushdown.", run: "single" }
     ];
@@ -279,7 +280,7 @@
     async function runSingle() {
       const token = tokenEl.value.trim();
       const sql = sqlEl.value.trim();
-      const maxStaleness = Number(stalenessEl.value || 0);
+      const maxStaleness = Number(stalenessEl.value !== "" ? stalenessEl.value : -1);
       if (!token || token.startsWith("PASTE_")) {
         resultsBodyEl.innerHTML = "<div class='error-card'>Missing JWT token. Generate tokens via cmd/token-gen and paste into TOKENS.</div>";
         return;
@@ -306,7 +307,7 @@
     async function runDoubleCache() {
       const token = tokenEl.value.trim();
       const sql = sqlEl.value.trim();
-      const maxStaleness = Number(stalenessEl.value || 0);
+      const maxStaleness = Number(stalenessEl.value !== "" ? stalenessEl.value : -1);
       runBtn.disabled = true;
       burstInspectorEl.innerHTML = "";
       try {
@@ -341,7 +342,7 @@
     async function runBurst() {
       const token = tokenEl.value.trim();
       const sql = sqlEl.value.trim();
-      const maxStaleness = Number(stalenessEl.value || 0);
+      const maxStaleness = Number(stalenessEl.value !== "" ? stalenessEl.value : -1);
       runBtn.disabled = true;
       try {
         const tasks = [];

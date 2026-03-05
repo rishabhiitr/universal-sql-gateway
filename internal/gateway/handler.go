@@ -82,7 +82,9 @@ func (h *Handler) Query(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, err, traceID)
 		return
 	}
-	plan.MaxStalenessMS = req.MaxStalenessMS
+	if req.MaxStalenessMS != nil {
+		plan.MaxStalenessMS = *req.MaxStalenessMS
+	}
 
 	resp, err := h.executor.Execute(ctx, principal, plan, req)
 	if err != nil {

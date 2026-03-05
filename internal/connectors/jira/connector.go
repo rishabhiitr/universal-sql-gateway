@@ -58,12 +58,18 @@ func (c *Connector) Fetch(ctx context.Context, _ *models.Principal, sourceQuery 
 		return nil, models.SourceMeta{}, err
 	}
 
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 	out := make([]models.Row, 0, len(c.rows))
 	for _, row := range c.rows {
 		if !matchesFilters(row, sourceQuery.Filters) {
 			continue
 		}
-		out = append(out, row)
+		copied := make(models.Row, len(row)+1)
+		for k, v := range row {
+			copied[k] = v
+		}
+		copied["_fetched_at"] = now
+		out = append(out, copied)
 		if sourceQuery.Limit > 0 && len(out) >= sourceQuery.Limit {
 			break
 		}

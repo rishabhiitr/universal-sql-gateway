@@ -44,7 +44,8 @@ func (c *TTLCache) Get(key string, maxStaleness time.Duration) (any, time.Durati
 	}
 
 	staleness := now.Sub(item.FetchedAt)
-	if maxStaleness >= 0 && staleness > maxStaleness {
+	// maxStaleness == -1 means "no constraint"; 0 means "force live"
+	if maxStaleness >= 0 && staleness >= maxStaleness {
 		return nil, staleness, false
 	}
 	return item.Value, staleness, true
