@@ -23,8 +23,21 @@ Connectors run in the same Go binary with goroutine pools, memory budgets, circu
 ### 3. Freshness Floor + Live-Fetch Budget + Graceful Degradation — vs Honoring max_staleness=0
 `max_staleness=0` is clamped to a per-connector floor (e.g., 30s). Live fetches are gated by a per-tenant token bucket. When budget is exhausted, stale cache is served with `CACHE_FORCED` transparency — not an error. **Give**: clients cannot guarantee perfectly fresh data. **Get**: one tenant's freshness demand cannot burn rate-limit budget for all tenants sharing the same OAuth token. See [freshness-and-caching.md §5](docs/data-plane/freshness-and-caching.md).
 
-### 4. Federated On-The-Fly Join + Size-Triggered S3 Materialization — vs Frequency-Based Materialization
-Default is in-memory hash join (build on smaller side). When memory budget is exceeded, DuckDB handles disk-backed execution. Join results are materialized to S3 **only when the result exceeds a size threshold** (~1MB) — no frequency counter or hit-rate tracking. **Give**: repeated small-to-medium joins recompute each time (source cache eliminates the costly part — SaaS API calls — so the join itself is <10ms on warm cache). **Get**: no counter-tracking infrastructure, no threshold tuning, no race conditions on threshold crossing — and zero compliance surface for small results. See [freshness-and-caching.md §Materialization](docs/data-plane/freshness-and-caching.md).
+### 4. Federated On-The-Fly Join + Size-Triggered S3 Materialization — vs Always-Materialize / Frequency-Based
+
+Default is in-memory hash join (build on smaller side); DuckDB handles spill-to-disk when memory budget is exceeded. Join results are written to S3 as encrypted Parquet **only when the serialized result exceeds ~1 MB**.
+
+**Why not always write joins to S3?** Source-level results are already cached in Redis. Once both sides are warm, the in-memory hash join on typical result sets (e.g. 200 × 2 000 rows → 800 matches) completes in <10 ms. Writing that to S3 would add ~20-50 ms PUT latency plus encryption and compliance overhead — slower than just recomputing next time.
+
+| | Always-materialize to S3 | Size-triggered (chosen) | Frequency-based |
+|---|---|---|---|
+| **Small joins (<1 MB)** | Unnecessary S3 PUT + compliance surface | Recompute in <10 ms from source cache | Recompute until frequency threshold hit, then materialize |
+| **Large joins (>1 MB)** | Cached; S3 GET ~20-50 ms | Same — materialized on first occurrence | Recompute N times before materializing |
+| **Infra complexity** | S3 lifecycle + encryption for every join | S3 lifecycle only for large results | + frequency counters, threshold tuning, race conditions |
+| **Compliance surface** | Every join result is a stored artifact | Only large results stored (short TTL, crypto-shred) | Same as always-materialize once threshold is crossed |
+| **Cold-start penalty** | None (always cached) | Recompute once per large join | Recompute N times for large joins |
+
+**Give**: repeated small-to-medium joins recompute each time (source cache makes this near-free). **Get**: no counter infrastructure, no threshold tuning, and zero compliance surface for the common case. See [freshness-and-caching.md §Materialization](docs/data-plane/freshness-and-caching.md).
 
 ### 5. OPAL Push for Policy Revocation — vs TTL-Only Propagation
 Security-critical changes (entitlement revocation, tenant off-boarding) propagate via OPAL push in ~1-2s. Low-severity changes (new connectors, schema updates) use 30-60s TTL pull. **Give**: OPAL server, sidecar per pod, event bus dependency — real operational complexity. **Get**: revoked user's query window shrinks from 60s to ~1-2s. Most systems accept the TTL window; we chose not to for enterprises with strict revocation SLAs. See [control-plane.md §3.2](docs/control-plane/control-plane.md).
