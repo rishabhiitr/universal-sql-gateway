@@ -14,8 +14,17 @@ Cross-app federated SQL query layer for enterprise SaaS applications. Users writ
 
 > These trade-offs assume the end-to-end production design described in the deep-dive docs below and the [six-month execution plan](docs/EXECUTION_PLAN.md). The prototype demonstrates the core query path; the trade-offs below reflect the design decisions that would govern the system at scale.
 
-### 1. Tenant-Scoped Fetch Cache + Post-Fetch RLS — vs Per-User Cache
-Cache is keyed on `(tenant, connector, table, pushed_filters)`, not per-user. The cache intentionally holds data individual users may not see — RLS/CLS filters are applied locally on read, same model as Postgres RLS. **Give**: cache stores rows the requesting user might not be authorized for. **Get**: one cache entry serves all users in the tenant — dramatically higher hit rates, lower rate-limit pressure, and manageable key-space. A per-user or per-query cache would produce O(users × queries) keys, making eviction, memory sizing, and invalidation unmanageable at 10M users. See [freshness-and-caching.md](docs/data-plane/freshness-and-caching.md).
+### 1. Tiered Caching (Redis + S3 + Query Result Cache) — vs Per-User Cache / Single Store
+
+Three trade-offs stacked on top of each other:
+
+**Tenant-scoped source cache — vs per-user cache.** Cache is keyed on `(tenant, connector, table)`, not per-user. The cache holds rows the requesting user may not be authorized for — RLS/CLS filters are applied on read. **Give**: cached data is broader than any single user's entitlement. **Get**: one entry serves all users in the tenant — dramatically higher hit rates, lower rate-limit pressure, and manageable key-space. Per-user keying would produce O(users × tables) entries, making eviction and memory sizing unworkable at 10M users.
+
+**Redis + S3 — vs a single cache store.** Source results < ~5 MB live in Redis; anything larger spills to encrypted S3 Parquet (connector fetches, large join intermediates). **Give**: two storage systems to operate, monitor, and capacity-plan. **Get**: Redis serves sub-ms hot reads; S3 handles bulk data cheaply with native lifecycle expiry and range reads for pagination. A Redis-only approach blows memory at scale; an S3-only approach adds 20-50 ms to every cache hit. S3 data is tenant-key-encrypted, enabling crypto-shredding on off-boarding.
+
+**Conditional query-result cache — vs no result caching / cache-everything.** Final computed results are cached only when the compute path was expensive (S3 download → DuckDB → join) or the result set is non-trivial (>1K rows). Key is `(tenant, SQL hash, user entitlements)`. **Give**: key-space can grow because the SQL hash and user entitlements (RLS/CLS) are part of the key — two users with different policies produce different entries. Mitigated by caching only expensive queries, short TTLs, and LRU eviction. **Get**: repeated queries — dashboards, reports, concurrent users running the same SQL — served instantly with zero recomputation. Not caching at all would re-execute expensive S3→DuckDB paths on every hit; caching everything would bloat key-space for queries that are trivially cheap to recompute.
+
+See [freshness-and-caching.md](docs/data-plane/freshness-and-caching.md).
 
 ### 2. In-Process Connectors + Bulkhead Isolation — vs Out-of-Process Microservices
 Connectors run in the same Go binary with goroutine pools, memory budgets, circuit breakers, and panic recovery. **Give**: a misbehaving connector can theoretically affect the process (mitigated by bulkheads). **Get**: no per-connector deployment, scaling, versioning, or health-check infrastructure — one binary to build, deploy, and debug. Also eliminates ~15-35ms of serialize/deserialize + network hop per join leg (for a typical 10K-row result). Every production federated engine (Trino, Presto, DuckDB) runs connectors in-process for the same reasons. Out-of-process justified only for untrusted code or different language runtimes. See [data-plane.md §2](docs/data-plane/data-plane.md).
@@ -23,23 +32,7 @@ Connectors run in the same Go binary with goroutine pools, memory budgets, circu
 ### 3. Freshness Floor + Live-Fetch Budget + Graceful Degradation — vs Honoring max_staleness=0
 `max_staleness=0` is clamped to a per-connector floor (e.g., 30s). Live fetches are gated by a per-tenant token bucket. When budget is exhausted, stale cache is served with `CACHE_FORCED` transparency — not an error. **Give**: clients cannot guarantee perfectly fresh data. **Get**: one tenant's freshness demand cannot burn rate-limit budget for all tenants sharing the same OAuth token. See [freshness-and-caching.md §5](docs/data-plane/freshness-and-caching.md).
 
-### 4. Federated On-The-Fly Join + Size-Triggered S3 Materialization — vs Always-Materialize
-
-Default is in-memory hash join (build on smaller side); DuckDB handles spill-to-disk when memory budget is exceeded. Join results are written to S3 as encrypted Parquet **only when the serialized result exceeds ~1 MB**.
-
-**Why not always write joins to S3?** Source-level results are already cached in Redis. Once both sides are warm, the in-memory hash join on typical result sets (e.g. 200 × 2 000 rows → 800 matches) completes in <10 ms. Writing that to S3 would add ~20-50 ms PUT latency plus encryption and compliance overhead — slower than just recomputing next time.
-
-| | Always-materialize to S3 | Size-triggered (chosen) |
-|---|---|---|
-| **Small joins (<1 MB)** | Unnecessary S3 PUT + compliance surface | Recompute in <10 ms from source cache |
-| **Large joins (>1 MB)** | Cached; S3 GET ~20-50 ms | Same — materialized on first occurrence |
-| **Infra complexity** | S3 lifecycle + encryption for every join | S3 lifecycle only for large results |
-| **Compliance surface** | Every join result is a stored artifact | Only large results stored (short TTL, crypto-shred) |
-| **Cold-start penalty** | None (always cached) | Recompute once per large join |
-
-**Give**: repeated small-to-medium joins recompute each time (source cache makes this near-free). **Get**: zero compliance surface for the common case, and S3 writes only where they actually save time. See [freshness-and-caching.md §Materialization](docs/data-plane/freshness-and-caching.md).
-
-### 5. OPAL Push for Policy Revocation — vs TTL-Only Propagation
+### 4. OPAL Push for Policy Revocation — vs TTL-Only Propagation
 Security-critical changes (entitlement revocation, tenant off-boarding) propagate via OPAL push in ~1-2s. Low-severity changes (new connectors, schema updates) use 30-60s TTL pull. **Give**: OPAL server, sidecar per pod, event bus dependency — real operational complexity. **Get**: revoked user's query window shrinks from 60s to ~1-2s. Most systems accept the TTL window; we chose not to for enterprises with strict revocation SLAs. See [control-plane.md §3.2](docs/control-plane/control-plane.md).
 
 ---

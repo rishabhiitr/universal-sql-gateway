@@ -1,6 +1,6 @@
 # Freshness and Caching Strategy
 
-This is the caching and freshness strategy for the data plane. It covers *why* we cache, *what* we cache (and why not query results), the predicate pushdown model that makes the cache effective, the freshness mechanics, entitlement interaction, join materialization, and the production cache topology.
+This is the caching and freshness strategy for the data plane. It covers *why* we cache, *what* we cache at each tier (source results, materializations, query results), the predicate pushdown model that makes the source cache effective, the freshness mechanics, join materialization with the three-tier cache flow, entitlement interaction, and the production cache topology.
 
 ---
 
@@ -34,7 +34,7 @@ The flow: **serve the query from cache if possible, then revalidate asynchronous
 
 ## 3. What to Cache
 
-### Why Not Cache at the Query Level?
+### Why Source-Level Caching Is the Primary Tier (Not Query-Level)
 
 The naive approach is to cache query results keyed by the full normalized SQL:
 
@@ -42,7 +42,7 @@ The naive approach is to cache query results keyed by the full normalized SQL:
 cache_key = hash(tenant_id + connector + normalized_sql)
 ```
 
-This breaks down immediately at scale:
+As the *primary* cache, this breaks down at scale:
 
 ```sql
 SELECT * FROM jira.issues WHERE assignee = 'alice'
@@ -50,9 +50,9 @@ SELECT * FROM jira.issues WHERE assignee = 'bob'
 SELECT * FROM jira.issues WHERE assignee = 'charlie'
 ```
 
-10,000 users → 10,000 cache entries, all querying the same underlying table with minor variations. Add filters like `status`, `priority`, `project`, date ranges — the number of unique queries is effectively infinite. Cache hit rate drops to single digits. Useless.
+10,000 users → 10,000 cache entries, all querying the same underlying table with minor variations. Add filters like `status`, `priority`, `project`, date ranges — the number of unique queries is effectively infinite. Hit rate drops to single digits as the primary caching strategy.
 
-The fundamental problem: **queries are infinite, but the data they fetch overlaps heavily.**
+The fundamental problem: **queries are infinite, but the data they fetch overlaps heavily.** This is why source-level caching (§3 below) is the primary tier. Query-result caching exists as a conditional third tier (§6) — only for expensive compute paths where the key-space cost is justified.
 
 ### The Solution: Cache at the Fetch Level (Pushed Predicates)
 
@@ -316,17 +316,6 @@ go revalidationGroup.Do(cacheKey, func() (interface{}, error) {
 
 Without this, 500 goroutines would each fire a conditional GET — burning 500 rate-limit tokens for what should be one API call.
 
-### Size-Based Tiering: Redis vs. S3
-
-Not all connector responses fit comfortably in Redis. A single fetch can return 100K+ rows (e.g., all issues in a large Jira project), easily 10-50MB serialized. Storing multi-MB blobs directly in Redis is problematic: expensive RAM, single-threaded event loop blocked during transfer, and network bandwidth saturation between app pod and Redis node.
-
-| Result size | Storage |
-|---|---|
-| **< 1MB** | Store directly in Redis |
-| **> 1MB** | Encrypted blob on S3 + Redis pointer (`s3://bucket/<tenant>/<key>.parquet`) |
-
-Redis stores the data when it's small, stores a pointer when it's large. S3 is the overflow tier.
-
 ### Cache Entry Structure
 
 ```
@@ -370,7 +359,50 @@ Every response includes freshness metadata so the caller always knows what they 
 
 ---
 
-## 5. How Entitlements (RLS/CLS) Interact with Cache
+## 5. Join Materialization and Three-Tier Cache
+
+Both sides of a cross-app join go through the fetch-cache pipeline independently. Once both results are available (from cache or live), the join executes locally:
+
+```
+Query: SELECT p.title, i.status
+       FROM github.prs p JOIN jira.issues i ON p.jira_key = i.issue_key
+       WHERE p.state = 'open'
+
+Step 1: Fetch github.prs (pushed: state='open')     → cache or live
+Step 2: Fetch jira.issues (pushed: none or broad)    → cache or live
+Step 3: Hash join in-process (DuckDB / in-memory)    → local, fast
+Step 4: Return joined result
+```
+
+If both sides are cache-warm, the entire join query completes with zero API calls.
+
+### Three Tiers
+
+**Tier 1 — Source cache** (always on). Caches raw connector responses keyed by `(tenant + connector + table + pushed_predicates)`. Results < ~5 MB live in Redis; larger results spill to encrypted S3 Parquet with a Redis pointer (`s3://cache/<tenant>/source/<key>.parquet`). This is what avoids redundant API calls and rate-limit burn.
+
+**Tier 2 — Large result materialization** (conditional). When join output or a single connector fetch exceeds ~5 MB, the result is persisted as encrypted Parquet on S3. Short TTL (≤ 30 min), crypto-shredded on tenant offboarding. S3 instead of node-local storage because stateless routing means no guarantee a query lands on the same node twice. An S3 GET (~20-50 ms) is still far cheaper than re-fetching from two SaaS APIs and re-joining.
+
+**Tier 3 — Query result cache** (conditional). Final computed results — post-RLS/CLS, post-join — are cached when the compute path was expensive (S3 download → DuckDB → join) or the result set is non-trivial (>1K rows). Key is `(tenant, SQL hash, user entitlements)`. Small results go to Redis; large results go to S3 Parquet. User entitlements are part of the key because two users with different RLS policies get different results.
+
+Why not cache every query result? The key-space includes the SQL hash *and* user entitlements — caching cheap queries (e.g., a 50-row single-source lookup already warm in Redis) would bloat the key-space for near-zero latency savings. Conditional caching + short TTLs + LRU eviction keep the key-space bounded. The payoff is on repeated expensive queries: dashboards, reports, and concurrent users running the same SQL get instant results with zero recomputation.
+
+**Why materialization caching matters.** It pays off in two cases: (1) the join itself is expensive — re-fetching from two SaaS APIs and re-computing a hash join over 100K+ rows costs minutes of wall time and rate-limit budget, while an S3 GET is ~30 ms; (2) source caches have expired but the joined result is still within the caller's staleness tolerance — the materialized result has its own TTL, so it can outlive the individual source caches and avoid unnecessary re-fetches.
+
+### Lookup
+
+The executor checks all three tiers. Query result cache is checked first (cheapest hit); source cache and materialization are checked in parallel:
+
+| Query Result Cache | Source Cache | Materialization | Action |
+|---|---|---|---|
+| Hit | — | — | Return immediately. Zero compute. |
+| Miss | All sides hit | — | Re-join locally from source cache. |
+| Miss | — | Hit | Pull Parquet from S3. Avoids SaaS API calls. |
+| Miss | Partial hit | Miss | Fetch missing sides, join with cached sides. |
+| Miss | Miss | Miss | Full live fetch. |
+
+---
+
+## 6. How Entitlements (RLS/CLS) Interact with Cache
 
 The entitlement service enforces row-level security (RLS) and column-level security (CLS). At first glance, this seems to conflict with the cache strategy:
 
@@ -429,101 +461,65 @@ User Carol query:    apply RLS locally         → same cache entry
 
 One API call serves all users. RLS is just an in-memory filter.
 
-### The Security Model
+### The Complete Cache Flow
 
-> "But the cache holds data the user isn't allowed to see!"
-
-Yes, and this is safe because:
-
-1. **Cache is internal** — users never access it directly. It's an in-memory store in the data plane. The API response only contains post-RLS/CLS data.
-2. **This is how databases work** — Postgres stores all rows on disk. RLS policies filter at query time, not storage time. Same pattern here.
-3. **The alternative is worse** — per-user fetches burn rate limits and kill cache hit rates. And the SaaS API already authorized the fetch using the tenant's service account — the data entered "your system" the moment the connector called the API.
-
-### The Complete Pipeline
+A cross-app JOIN query showing how the three tiers, entitlements, and compute interact end-to-end:
 
 ```
-┌──────────────────────────────────────────┐
-│  User Query (with user's context)        │
-│  SELECT * FROM salesforce.accounts       │
-│  WHERE region = 'APAC'                   │
-└──────────────┬───────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  User Query                                                      │
+│  SELECT p.title, i.status                                        │
+│  FROM github.prs p JOIN jira.issues i ON p.key = i.key           │
+│  WHERE p.state = 'open'                                          │
+└──────────────┬───────────────────────────────────────────────────┘
                │
                ▼
-┌──────────────────────────────────────────┐
-│  Query Planner                           │
-│  1. Determine pushed predicates (broad)  │  ← for cache/fetch optimization
-│  2. Determine local filters (narrow)     │  ← user's WHERE clause
-│  3. Query Entitlement Service:           │
-│     - Get RLS filters for this user      │  ← automatic row filtering
-│     - Get CLS masks for this user        │  ← column masking/removal
-└──────────────┬───────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  Tier 3 — Query Result Cache                                     │
+│  Key = hash(tenant + SQL + user entitlements)                    │
+│                                                                  │
+│  HIT  → return immediately, zero compute                         │
+│  MISS ↓                                                          │
+└──────────────┬───────────────────────────────────────────────────┘
                │
                ▼
-┌──────────────────────────────────────────┐
-│  Fetch Layer (tenant-scoped)             │
-│  Cache key = tenant + connector +        │
-│              table + pushed_predicates   │
-│                                          │
-│  Cache hit? → use it                     │
-│  Cache miss? → call SaaS API             │
-│                                          │
-│  Returns: BROAD dataset (all tenant data)│
-└──────────────┬───────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  Tier 2 — Materialization Cache (S3 Parquet)                     │
+│  Key = hash(tenant + join signature + source versions)           │
+│                                                                  │
+│  HIT  → pull Parquet from S3 (~30ms), skip all API calls         │
+│  MISS ↓                                                          │
+└──────────────┬───────────────────────────────────────────────────┘
                │
                ▼
-┌──────────────────────────────────────────┐
-│  Post-Fetch Pipeline (all local)         │
-│  1. Apply user's WHERE filters           │
-│  2. Apply RLS (row filtering)            │  ← security enforcement here
-│  3. Apply CLS (column masking)           │  ← security enforcement here
-│  4. Apply ORDER BY / LIMIT               │
-│  5. Return to user                       │
-└──────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  Tier 1 — Source Cache (per connector, in parallel)              │
+│                                                                  │
+│  ┌─────────────────────────────┐ ┌─────────────────────────────┐ │
+│  │ github.prs                  │ │ jira.issues                 │ │
+│  │ key = tenant+github+prs+   │ │ key = tenant+jira+issues+{} │ │
+│  │       {state:'open'}       │ │                             │ │
+│  │                             │ │                             │ │
+│  │ < 5MB → Redis     (HIT)    │ │ > 5MB → S3 Parquet  (HIT)  │ │
+│  │ > 5MB → S3 Parquet         │ │                             │ │
+│  │ MISS  → live SaaS API call │ │ MISS  → live SaaS API call │ │
+│  └─────────────────────────────┘ └─────────────────────────────┘ │
+└──────────────┬───────────────────────────────────────────────────┘
+               │
+               ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  Compute (local)                                                 │
+│  1. Hash join in-process (DuckDB / in-memory)                    │
+│  2. Apply user WHERE filters                                     │
+│  3. Apply RLS (row filtering)        ← entitlements here         │
+│  4. Apply CLS (column masking)       ← entitlements here         │
+│  5. ORDER BY / LIMIT                                             │
+│                                                                  │
+│  If result expensive to recompute → write back to Tier 3 / Tier 2│
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-Cache strategy and entitlements don't conflict — they operate at different stages:
-- **Cache optimizes the fetch** (tenant-level, broad)
-- **Entitlements secure the response** (user-level, narrow)
-
----
-
-## 6. Join Materialization
-
-Both sides of a cross-app join go through the fetch-cache pipeline independently. Once both results are available (from cache or live), the join executes locally:
-
-```
-Query: SELECT p.title, i.status
-       FROM github.prs p JOIN jira.issues i ON p.jira_key = i.issue_key
-       WHERE p.state = 'open'
-
-Step 1: Fetch github.prs (pushed: state='open')     → cache or live
-Step 2: Fetch jira.issues (pushed: none or broad)    → cache or live
-Step 3: Hash join in-process (DuckDB / in-memory)    → local, fast
-Step 4: Return joined result
-```
-
-If both sides are cache-warm, the entire join query completes with zero API calls.
-
-### Two Tiers
-
-**Source cache** (always on) — caches raw connector responses keyed by `(connector + table + pushed_predicates + tenant)`. In-memory (Redis). This is what avoids redundant API calls.
-
-**Materialization cache** (conditional) — caches joined results that exceed a size threshold (~1MB serialized). Stored as encrypted Parquet on S3, with a Redis pointer (`mat:<plan_hash>:<tenant> → s3://...`). Short TTL (≤ 30 min), crypto-shredded on tenant offboarding.
-
-The trigger is result size only — no frequency counters. Small joins are sub-millisecond from source cache + in-memory hash join; only large joins (100K+ rows per side) are worth persisting. S3 instead of node-local storage because stateless routing means no guarantee a query lands on the same node twice. An S3 GET (~20-50ms) is still far cheaper than re-fetching from two SaaS APIs.
-
-**Why materialization caching matters.** It pays off in two cases: (1) the join itself is expensive — re-fetching from two SaaS APIs and re-computing a hash join over 100K+ rows costs minutes of wall time and rate-limit budget, while an S3 GET is ~30ms; (2) source caches have expired but the joined result is still within the caller's staleness tolerance — the materialized result has its own TTL, so it can outlive the individual source caches and avoid unnecessary re-fetches.
-
-### Lookup
-
-The executor checks both tiers in parallel — they answer different questions ("do I have raw data from each source?" vs. "do I have the joined result?"):
-
-| Source Cache | Materialization | Action |
-|---|---|---|
-| All sides hit | — | Re-join locally from source cache. Fastest path. |
-| Miss | Hit | Pull Parquet from S3. Avoids SaaS API calls entirely. |
-| Partial hit | Miss | Fetch missing sides from connectors, join with cached sides. |
-| Miss | Miss | Full live fetch. |
+The flow is top-down: cheapest check first (Tier 3, a single Redis GET), then materialization (Tier 2, an S3 GET), then source caches (Tier 1, per-connector). A hit at any tier short-circuits everything below it. Cache optimizes the fetch (tenant-level, broad); entitlements secure the response (user-level, narrow).
 
 ---
 
@@ -534,9 +530,10 @@ We are not a data store. Cached data is transient and bounded:
 - **TTL eviction**: Every entry expires per connector config (30s to 1hr typically).
 - **LRU eviction**: When cache memory exceeds the configured limit, least-recently-used entries are evicted first.
 - **Tenant offboarding**: All cache entries for a tenant are purged immediately. Since cache is keyed by tenant, this is a simple prefix delete.
-- **No persistent storage**: Cache lives in-memory (Redis for distributed, in-process for single-node). Nothing is written to disk or S3 (except materialization tier, which has its own short TTL). When the process restarts, cache is cold — queries just hit live API until the cache warms up.
+- **S3 lifecycle**: Large source results, materialized joins, and large query results spill to S3. Cleaned up by S3 object lifecycle rules (bulk expiry) + a cron job for minute-level TTL precision (S3 lifecycle has ~1-day minimum granularity). All S3 data is tenant-key-encrypted.
+- **Cold start**: When Redis restarts, cache is cold — queries hit live API until the cache warms. S3 data survives restarts but is TTL-bound regardless.
 
-This keeps us squarely in "query accelerator" territory and avoids any compliance concerns around data retention, GDPR right-to-erasure, or SaaS vendor ToS restrictions on data mirroring.
+This keeps us in "query accelerator" territory. All cached data is transient (TTL-bound, LRU-evicted, or lifecycle-expired). Tenant offboarding triggers crypto-shredding — rotating the tenant's KMS key makes all S3 and Redis data unrecoverable without waiting for TTL expiry.
 
 ---
 
@@ -566,7 +563,9 @@ Lookups are always single-key. JOINs issue two pipelined GETs (~1ms total). Hot 
 | **Freshness control** | `max_staleness` hint, clamped by connector floor. ETag for cheap revalidation. |
 | **Abuse protection** | Floor staleness + per-tenant live-fetch budget. Transparent `CACHE_FORCED` fallback. |
 | **Join strategy** | Each side cached independently. Join computed locally from cached fetches. |
-| **Data retention** | In-memory only. TTL + LRU eviction. No persistence. No compliance burden. |
+| **Query result cache** | Conditional — only expensive paths (S3→DuckDB→join) or non-trivial results (>1K rows). Keyed by `(tenant, SQL hash, user entitlements)`. |
+| **Storage tiering** | Redis for hot/small data (< ~5 MB). S3 Parquet for large source results, materializations, and large query results. |
+| **Data retention** | All cached data is transient. TTL + LRU eviction in Redis. S3 lifecycle rules + cron for minute-level cleanup. Crypto-shredding on tenant offboarding. |
 | **Entitlements** | RLS/CLS applied post-fetch on cached data. Cache is tenant-scoped, not user-scoped. |
 | **Transparency** | Every response carries `freshness_ms`, `freshness_source`, and `rate_limit_status`. |
 | **Topology** | Redis Cluster with consistent hashing. Single-key lookups. S3 spill for large entries. |
