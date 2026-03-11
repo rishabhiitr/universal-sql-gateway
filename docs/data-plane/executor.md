@@ -460,15 +460,16 @@ Note: RLS/CLS are applied **before** the join, not after. Each side is filtered 
 ## 5. Spill-to-Disk Strategy
 
 When in-memory execution would exceed budget, the executor routes to spill mode.
+Use two layers intentionally: **node-local Parquet scratch files** for the active execution, and **S3-backed cache/materialization** for large artifacts that must survive beyond the current process or be reused by later queries (as described in `freshness-and-caching.md`).
 
 ### Spill Triggers
 
 | Condition | Metric | Action |
 |---|---|---|
-| Single connector returns >50K rows | Row count in Fetch response | Write to Parquet on local disk; stream to executor |
+| Single connector returns >50K rows | Row count in Fetch response | Write to local Parquet scratch for this execution; publish to S3-backed source cache/materialization if the cache tier decides to retain it |
 | Hash join build side >100K rows | Row count in hash table | Build hash table on DuckDB (disk-backed) instead of in-memory map |
 | Process memory >70% of GOMEMLIMIT | `runtime.MemStats.HeapInuse` | Trigger forced spill for active queries; switch to disk-backed execution |
-| Query result set >10MB | Estimated bytes of projected rows | Write result to S3; return presigned URL instead of inline rows |
+| Query result set >10MB | Estimated bytes of projected rows | Persist result to S3 and return a handle/presigned URL instead of inline rows |
 
 ### Spill Flow
 
@@ -478,11 +479,12 @@ Normal path:
 
 Spill path:
   Connector.Fetch() -> []Row -> exceeds threshold
-    -> Write rows to local Parquet file
+    -> Write rows to local Parquet scratch file
     -> Execute join in DuckDB on Parquet files
     -> Write result to Parquet
+    -> If reusable/TTL-bound, persist encrypted Parquet to S3 via cache/materialization layer
     -> If small, read back to memory and return inline
-    -> If large, upload to S3 and return presigned URL
+    -> If large, return handle/presigned URL backed by S3
 ```
 
 ### DuckDB Runtime Modes
@@ -500,7 +502,7 @@ Decision rule:
 Spill is an execution concern, not a connector concern:
 - Connectors fetch source rows and return `[]Row`.
 - The executor decides join strategy and memory-safe routing.
-- File push/write (`/tmp/*.parquet`, optional S3 output) happens in executor-controlled execution paths.
+- Local scratch files (`/tmp/*.parquet`) are executor-owned execution detail; durable reusable artifacts are handed off to the cache/materialization layer for S3 persistence.
 
 ---
 
@@ -523,7 +525,7 @@ Is result estimatable?
     → SYNC path (inline response)
 
   Yes, >50K rows or join of >10K × >10K?
-    → ASYNC path (job queue)
+    → ASYNC path (durable job queue, e.g. SQS)
 
   Unknown (first query, no cache, no stats)?
     → Start SYNC, switch to ASYNC if timeout approaching
@@ -543,11 +545,11 @@ Gateway sets 10s timeout context
   → Executor starts fetching concurrently
   → After 7s, one connector is still paginating
   → 3s remaining, estimated 5s more needed
-  → If allow_async in request → enqueue remainder, return 202 with job_id
+  → If allow_async in request → persist async job state, enqueue to durable queue (e.g. SQS), return 202 with job_id
   → If !allow_async → wait until timeout → SOURCE_TIMEOUT with partial results hint
 ```
 
-The executor monitors `ctx.Deadline()` in the fetch loop. It doesn't commit to sync or async upfront — starts sync, escalates if needed.
+The executor monitors `ctx.Deadline()` in the fetch loop. It doesn't commit to sync or async upfront — starts sync, escalates if needed. On handoff, it persists a resumable job spec/checkpoint (query plan, principal, freshness settings, and any completed-source state), enqueues that job to a durable queue, and returns a `job_id` for client polling. It does not try to suspend and serialize live in-flight goroutines.
 
 ---
 
@@ -564,5 +566,5 @@ The executor monitors `ctx.Deadline()` in the fetch loop. It doesn't commit to s
 | **Hash join by default, hybrid DuckDB spill path** | Hash join is O(n+m) and optimal for equi-joins under 50K rows per side. Use in-process DuckDB for latency-sensitive small spill cases; use sidecar DuckDB for async/large spill cases to isolate memory and protect sync traffic. |
 | **Planner as pure function** | No I/O, no side effects. Produces a QueryPlan struct that the executor consumes. Enables planner replacement (cost-based, ML-assisted) without touching the executor. |
 | **Memory accounting is approximate** | Go doesn't support per-goroutine memory limits. Approximate accounting (row count × estimated row size) is sufficient to prevent catastrophic OOM. Exact tracking would require instrumenting every allocation — too costly. |
-| **Async path is opt-in** | Not all queries benefit from async. Interactive queries should fail fast (429 with Retry-After). Batch/reporting queries should queue gracefully. Client declares intent via `allow_async`. |
+| **Async path is opt-in** | Not all queries benefit from async. Interactive queries should fail fast (429 with Retry-After). Batch/reporting queries should queue gracefully via a durable job queue (for example, SQS) and return `202 Accepted` with a `job_id`. Client declares intent via `allow_async`. |
 | **Connector panic recovery** | A single `recover()` in the bulkhead prevents one connector's crash from taking down the entire gateway process. This is defense-in-depth alongside circuit breakers and timeouts. |

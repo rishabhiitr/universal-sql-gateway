@@ -6,7 +6,7 @@
 |---|---|
 | **Security is not deferred** | KMS and audit pipeline are M2 — they are table stakes for any enterprise pilot, not scale features |
 | **One engineer, one domain** | Each engineer owns a domain end-to-end for the full six months. No context switching, no handoffs |
-| **Managed over self-hosted** | Use managed services (EKS Fargate, managed Kafka — MSK or Confluent Cloud, CodeDeploy) instead of self-hosting Kubernetes, Kafka, or CD tooling. Core differentiation is the query layer and connector SDK, not infrastructure operations |
+| **Managed over self-hosted** | Use managed services (EKS managed control plane + node groups, managed Kafka — MSK or Confluent Cloud, CodePipeline) instead of self-hosting cluster infrastructure, Kafka, or CD control planes. Core differentiation is the query layer and connector SDK, not infrastructure operations |
 
 ---
 
@@ -20,7 +20,7 @@
 | Backend Engineer — L4 | 1 | Connector SDK + all connectors (takes over from TL Data Plane once SDK pattern is set) | M1 |
 | Backend Engineer — L4 | 1 | Query planner + parser (takes over from Staff once interfaces are defined) | M1 |
 | Security Engineer | 1 | KMS, audit pipeline, secrets, compliance | M2 |
-| Infra Engineer | 1 | EKS, Terraform, managed CD pipeline | M1 half-time, M2 full |
+| Infra Engineer | 1 | EKS, node pools, Terraform, managed pipeline | M1 half-time, M2 full |
 | QA Engineer | 1 | Load tests, failure drills, runbooks | M3 |
 | Product Manager | 1 | Customer interviews, design partner feedback, market research | M1 |
 
@@ -41,9 +41,9 @@ Single microservice. Everything configured in YAML — tenants, policies, connec
 - **Query path**: SQL parse → fan-out to GitHub + Jira connectors in parallel → join results → apply access control → return with metadata
 - **OPA Go SDK embedded from day one**: policies are `.rego` files loaded from disk at container startup. Simple rules: row filters, column masks, role checks. No bespoke Go authorization logic — OPA from the start so M5 is a config change, not a rewrite
 - **Circuit breakers per connector from day one**: not a scale concern, a correctness concern. One flaky API must not stall all queries
-- **Rate limiting**: in-memory, sufficient for fixed-node infrastructure
+- **Rate limiting + upstream throttling**: in-memory token bucket, sufficient for the initial single-cluster deployment. On upstream `429`s or transient throttling, use capped exponential backoff; if budget is still exhausted after retries, fail fast with a clear actionable error. No shared cache yet
 - **Audit**: structured JSON log lines written to S3 (best-effort, no pipeline)
-- **Deploy**: EKS Fargate + Terraform from day one; GitHub Actions CI (test + build + push to ECR on every PR merge)
+- **Deploy**: Managed EKS + Terraform from day one; GitHub Actions CI (test + build + push to ECR on every PR merge)
 - **Observability**: four Grafana panels — query latency, connector fetch time, rate-limit rejections
 
 **Exit**: End-to-end cross-app query works for 1 tenant with OPA-evaluated access control.
@@ -60,9 +60,11 @@ Before any external pilot, two questions will be asked: "where are secrets store
 - **Audit pipeline**: managed Kafka (MSK or Confluent Cloud) → managed S3 Sink Connector. Single topic `audit-events` with `tenant_id` as a field. Per-tenant S3 prefixes via `FieldAndTimeBasedPartitioner`. 60-second in-memory buffer before S3 flush. Offsets committed only after successful S3 write — at-least-once delivery, no data loss on failure
 - **SSO**: one OIDC integration (Okta — most common in enterprise). Token-based HMAC auth deprecated
 - **OPA still loads from disk**: control plane is M3. Policy change still means redeploy. Acceptable at 1–2 tenants
+- **Freshness contract (minimal)**: every response returns `freshness_ms`, `freshness_source`, and connector rate-limit status so callers can distinguish live fetches from degraded behavior before shared caching arrives
+- **Network security**: edge TLS and Kubernetes `NetworkPolicy` allow-lists arrive before service mesh. Full Istio mTLS is deferred to later hardening, not the critical path for early pilots
 - **Deploy**: still manual
 
-**Exit**: Audit events in tenant-partitioned S3 within 60 seconds. Secrets in KMS. Okta SSO working.
+**Exit**: Audit events in tenant-partitioned S3 within 60 seconds. Secrets in KMS. Okta SSO working. Responses expose freshness and rate-limit metadata.
 
 ---
 
@@ -77,11 +79,11 @@ Before any external pilot, two questions will be asked: "where are secrets store
   - Row filters + column masks
 - **OPA bundle endpoint**: control plane exposes `GET /internal/bundles/policy.tar.gz`. Reads policies from Postgres, packages as OPA bundle format (tar.gz with `.rego` files + manifest). Built and tested — not yet the live policy source
 - **3rd connector**: validates that the connector SDK generalizes across different auth flows and rate-limit models
-- **Query caching design**: sketch interfaces and data model — cache key strategy (normalized query hash), TTL contract, invalidation triggers, Redis key schema. No implementation; design artifact produced for M4 execution
+- **Freshness + caching v1**: introduce an in-process source cache with `max_staleness`, soft TTL / hard TTL, and singleflight revalidation. Goal is quota protection and bounded staleness, not distributed scale yet
 - **Rate-limit service design**: sketch interfaces — token bucket API, per-connector/tenant/user bucket hierarchy, Redis data structures, backpressure contract. No implementation; design artifact produced for M4 execution
 - YAMLs remain the live config source while control plane is being validated
 
-**Exit**: Control plane service running. Bundle endpoint tested. Caching and rate-limit interfaces specced and reviewed. Data plane still on YAMLs.
+**Exit**: Control plane service running. Bundle endpoint tested. Freshness/caching v1 live. Redis rate-limit interfaces specced and reviewed. Data plane still on YAMLs.
 
 ---
 
@@ -92,11 +94,11 @@ Before any external pilot, two questions will be asked: "where are secrets store
 - **YAML → control plane migration**: migrate all tenant configs, connector configs, and policies into Postgres. OPA switches to polling the control plane bundle endpoint (policy changes now take effect in ≤ 30s, no redeploy)
 - **YAMLs fully deprecated** once all tenants migrated
 - **Redis-backed rate limiting**: replaces in-memory, required when nodes scale beyond fixed infra
-- **Redis-backed query caching**: first introduction of caching. Cache key = normalized query hash, TTL-based invalidation. No in-memory caching precursor — Redis directly
+- **Redis-backed hot cache**: move the M3 source cache into Redis so hot fetches are shared across nodes
 - **Async query path**: when a connector's rate budget is exhausted, queue the query and return a job ID for polling. Prevents blocking the request thread on slow upstreams
 - **2nd OIDC integration**: pick based on early customer demand
 
-**Exit**: Control plane is the only config source. Policy change without redeploy. Rate limiting and caching operational across multiple nodes.
+**Exit**: Control plane is the only config source. Policy change without redeploy. Rate limiting and Redis-backed hot cache operational across multiple nodes.
 
 ---
 
@@ -105,11 +107,11 @@ Before any external pilot, two questions will be asked: "where are secrets store
 **Sub-second policy revocation. Large joins handled. Deployment pipeline live.**
 
 - **OPAL server**: connects to control plane Postgres, detects policy changes, pushes bundle updates to OPA via WebSocket. OPA evaluator code unchanged — only the bundle source switches from polling to push. Policy revocation propagates in < 2 seconds
-- **Spill-to-disk materialization**: when a cross-app join exceeds the memory threshold, automatically spill to a temporary disk-based engine. Prevents OOM on large result sets
-- **Managed CD pipeline**: GitHub Actions → ECR → AWS CodeDeploy with canary (10% → 50% → 100%), SLO-gated promotion, automated rollback on error-rate breach. Manual promotion gate — no auto-deploy to production
+- **S3-backed large-result materialization**: large source results and expensive joins spill to encrypted Parquet on S3 with short TTLs. Keeps the hot path simple while avoiding OOMs and repeated SaaS fetches
+- **Managed CD pipeline**: GitHub Actions → ECR → AWS CodePipeline for staged environment promotion. EKS uses native rolling updates with readiness checks, health-based rollback, and a manual promotion gate for production
 - **Performance testing**: Tech Lead drives. Identify bottlenecks under load. Fix before M6
 
-**Exit**: Policy revocation < 2s. Large joins handled without OOM. Canary deployment operational.
+**Exit**: Policy revocation < 2s. Large joins handled without OOM. Managed deployment promotion pipeline operational.
 
 ---
 
@@ -122,6 +124,7 @@ Before any external pilot, two questions will be asked: "where are secrets store
 - Runbooks for the failure modes covered in drills
 - SLO dashboard with error budget tracking
 - Fix performance regressions surfaced in M5 testing
+- **Service-to-service mTLS only if justified**: introduce Istio for regulated or single-tenant hardening paths if customer requirements demand it. It is not a gate for the shared-infra pilot path
 - Single region, multi-AZ. Rely on AWS for availability within region. Multi-region is out of scope for GA
 - Last two weeks: perf fixes and sign-off process
 
@@ -134,21 +137,21 @@ Before any external pilot, two questions will be asked: "where are secrets store
 | Capability | M1 | M2 | M3 | M4 | M5 | M6 |
 |---|---|---|---|---|---|---|
 | **Connectors** | GitHub + Jira (SDK established) | — | 3rd connector | 4th connector | — | — |
-| **Query Planner** | SQL parse + fan-out + join | — | — | Async overflow (job ID) | Spill to disk | — |
+| **Query Planner** | SQL parse + fan-out + join | — | — | Async overflow (job ID) | S3-backed spill/materialization | — |
 | **AuthN** | HMAC token | Okta OIDC | — | 2nd OIDC provider | — | — |
 | **AuthZ — Evaluator** | OPA Go SDK embedded | — | — | — | — | — |
 | **AuthZ — Policy Source** | Rego files on disk | Rego files on disk | Rego files on disk (bundle endpoint built, not live) | Bundle from control plane (30s poll, live) | OPAL push (< 2s) | — |
 | **Circuit Breakers** | Per connector, from day one | — | — | — | — | — |
-| **Rate Limiting** | In-memory | — | — | Redis-backed, multi-node | — | — |
-| **Caching** | — | — | — | Redis-backed, query hash key (first introduction) | Large-result materialization | — |
+| **Rate Limiting** | In-memory + capped backoff/fail | — | — | Redis-backed, multi-node | — | — |
+| **Caching** | — | — | In-process freshness cache (`max_staleness`, soft/hard TTL) | Redis-backed hot cache | S3 materialization / spill | — |
 | **Audit** | Structured logs → S3 (best-effort) | Managed Kafka + S3 Sink (per-tenant prefix, 60s buffer, at-least-once) | — | — | — | — |
 | **Secrets / KMS** | Env vars | Per-tenant KMS keys (envelope encryption) | — | — | Automated key rotation | — |
 | **Control Plane** | YAML | YAML | Postgres-backed service built, YAMLs still live | Cutover complete, YAMLs deprecated | — | — |
 | **CI** | GitHub Actions (test + build + push to ECR on PR) | — | — | — | — | — |
-| **CD** | Manual deploy | Manual | Manual | Manual | Managed CD + canary (CodeDeploy) | — |
-| **Infra** | EKS Fargate, Terraform | MSK | Terraform modules expanded | Redis cluster | Multi-AZ | Chaos-validated |
+| **CD** | Manual deploy | Manual | Manual | Manual | Managed pipeline (CodePipeline) | — |
+| **Infra** | Managed EKS + node groups, Terraform | MSK | Terraform modules expanded | Redis cluster | Multi-AZ | Chaos-validated |
 | **Observability** | Grafana (4 panels) | — | Distributed tracing | — | Alerting + SLO budgets | Runbooks + manual failure drills |
-| **Networking** | Plain HTTP | — | — | — | — | mTLS (service mesh) |
+| **Networking** | Edge TLS at gateway | Kubernetes `NetworkPolicy` allow-lists | — | — | — | Istio mTLS (regulated / hardening only) |
 
 ---
 
