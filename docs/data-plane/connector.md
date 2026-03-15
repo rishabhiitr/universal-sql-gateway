@@ -91,7 +91,7 @@ goroutine_pool_size = min(
 
 Use a shared global pool with per-connector caps:
 
-- Per-connector cap protects the upstream SaaS API.
+- Per-connector cap prevents one connector from hoarding all goroutines — a slow or high-traffic connector cannot starve the others.
 - Global cap protects pod-wide saturation.
 
 ```go

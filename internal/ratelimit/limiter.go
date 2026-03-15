@@ -35,23 +35,21 @@ func New(defaultCfg Config, connectorCfg map[string]Config, tenantOverrides map[
 
 func (s *Service) Allow(_ context.Context, tenantID, connectorID string) *qerrors.QueryError {
 	limiter := s.getOrCreateLimiter(tenantID, connectorID)
-	reservation := limiter.Reserve()
-	if !reservation.OK() {
-		return qerrors.New(
-			qerrors.CodeRateLimitExhausted,
-			"connector request budget exhausted",
-			connectorID,
-			0,
-			nil,
-		)
-	}
-
-	delay := reservation.DelayFrom(time.Now())
-	if delay <= 0 {
+	if limiter.Allow() {
 		return nil
 	}
-
-	reservation.Cancel()
+	// Compute delay without consuming or scheduling any token.
+	// tokens < 0 means we are in deficit; time to recover 1 token = 1/rate.
+	// tokens >= 0 but Allow() failed means burst is 0; delay = 1/rate.
+	tokens := limiter.Tokens()
+	var delay time.Duration
+	if r := float64(limiter.Limit()); r > 0 {
+		deficit := 1.0 - tokens // how many tokens we need beyond current balance
+		if deficit < 1.0 {
+			deficit = 1.0
+		}
+		delay = time.Duration(deficit / r * float64(time.Second))
+	}
 	return qerrors.New(
 		qerrors.CodeRateLimitExhausted,
 		"connector request budget exhausted; retry later",

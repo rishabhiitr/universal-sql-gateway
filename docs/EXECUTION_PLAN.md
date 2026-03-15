@@ -61,7 +61,7 @@ Before any external pilot, two questions will be asked: "where are secrets store
 - **SSO**: one OIDC integration (Okta — most common in enterprise). Token-based HMAC auth deprecated
 - **OPA still loads from disk**: control plane is M3. Policy change still means redeploy. Acceptable at 1–2 tenants
 - **Freshness contract (minimal)**: every response returns `freshness_ms`, `freshness_source`, and connector rate-limit status so callers can distinguish live fetches from degraded behavior before shared caching arrives
-- **Network security**: edge TLS and Kubernetes `NetworkPolicy` allow-lists arrive before service mesh. Full Istio mTLS is deferred to later hardening, not the critical path for early pilots
+- **Network security**: edge TLS and Kubernetes `NetworkPolicy` allow-lists arrive before full service-mesh rollout. In parallel, choose Istio and validate workload identity + mTLS on a narrow service path so east-west encryption is designed in early, not deferred to GA
 - **Deploy**: still manual
 
 **Exit**: Audit events in tenant-partitioned S3 within 60 seconds. Secrets in KMS. Okta SSO working. Responses expose freshness and rate-limit metadata.
@@ -97,6 +97,7 @@ Before any external pilot, two questions will be asked: "where are secrets store
 - **Redis-backed hot cache**: move the M3 source cache into Redis so hot fetches are shared across nodes
 - **Async query path**: when a connector's rate budget is exhausted, queue the query and return a job ID for polling. Prevents blocking the request thread on slow upstreams
 - **2nd OIDC integration**: pick based on early customer demand
+- **Initial Istio rollout on core service paths**: enable service-to-service mTLS first for the query gateway, rate-limit service, and control-plane bundle path. Keep the scope narrow while the control-plane cutover and Redis scale work land
 
 **Exit**: Control plane is the only config source. Policy change without redeploy. Rate limiting and Redis-backed hot cache operational across multiple nodes.
 
@@ -124,7 +125,7 @@ Before any external pilot, two questions will be asked: "where are secrets store
 - Runbooks for the failure modes covered in drills
 - SLO dashboard with error budget tracking
 - Fix performance regressions surfaced in M5 testing
-- **Service-to-service mTLS only if justified**: introduce Istio for regulated or single-tenant hardening paths if customer requirements demand it. It is not a gate for the shared-infra pilot path
+- **Strict mTLS hardening**: expand Istio mTLS to all inter-service paths, enforce strict mesh policy in covered namespaces, and document break-glass / recovery procedures for sidecar or certificate failures
 - Single region, multi-AZ. Rely on AWS for availability within region. Multi-region is out of scope for GA
 - Last two weeks: perf fixes and sign-off process
 
@@ -151,7 +152,7 @@ Before any external pilot, two questions will be asked: "where are secrets store
 | **CD** | Manual deploy | Manual | Manual | Manual | Managed pipeline (CodePipeline) | — |
 | **Infra** | Managed EKS + node groups, Terraform | MSK | Terraform modules expanded | Redis cluster | Multi-AZ | Chaos-validated |
 | **Observability** | Grafana (4 panels) | — | Distributed tracing | — | Alerting + SLO budgets | Runbooks + manual failure drills |
-| **Networking** | Edge TLS at gateway | Kubernetes `NetworkPolicy` allow-lists | — | — | — | Istio mTLS (regulated / hardening only) |
+| **Networking** | Edge TLS at gateway | Kubernetes `NetworkPolicy` allow-lists + Istio design / POC | — | Initial Istio mTLS on core service paths | — | Strict Istio mTLS enforcement + runbooks |
 
 ---
 

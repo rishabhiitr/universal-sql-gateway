@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
 	"github.com/rishabhm/universal-sql-query-layer/internal/models"
@@ -77,7 +80,12 @@ func (h *Handler) Query(w http.ResponseWriter, r *http.Request) {
 		attribute.String("tenant.id", principal.TenantID),
 	)
 
+	_, parseSpan := tracer.Start(ctx, "query.parse",
+		trace.WithAttributes(attribute.Int("sql.length", len(req.SQL))),
+	)
+	time.Sleep(30 * time.Millisecond)
 	plan, err := h.parser.ParseSQL(req.SQL)
+	parseSpan.End()
 	if err != nil {
 		h.writeError(w, err, traceID)
 		return
@@ -109,16 +117,19 @@ func (h *Handler) writeError(w http.ResponseWriter, err error, traceID string) {
 		return
 	}
 
-	if qErr.RetryAfter > 0 {
-		w.Header().Set("Retry-After", strconv.FormatInt(int64(qErr.RetryAfter.Seconds()), 10))
-	}
-
-	writeJSON(w, qErr.HTTPStatus(), map[string]any{
+	body := map[string]any{
 		"code":     qErr.Code,
 		"message":  qErr.Message,
 		"source":   qErr.Source,
 		"trace_id": traceID,
-	})
+	}
+	if qErr.RetryAfter > 0 {
+		retryS := int64(math.Ceil(qErr.RetryAfter.Seconds()))
+		w.Header().Set("Retry-After", strconv.FormatInt(retryS, 10))
+		body["retry_after_s"] = retryS
+	}
+
+	writeJSON(w, qErr.HTTPStatus(), body)
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

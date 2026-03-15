@@ -156,5 +156,6 @@ Tokens (admin / developer / viewer) are generated inside the script using the sa
 
 | What | PromQL |
 |---|---|
-| Requests by status (200/429) | `query_gateway_requests_total{path="/v1/query"}` |
-| Latency histogram | `query_gateway_request_duration_seconds_bucket{path="/v1/query"}` |
+| P95 / P99 end-to-end latency | `histogram_quantile(0.99, rate(query_gateway_request_duration_seconds_bucket{path="/v1/query"}[2m]))` |
+| Requests split by status (200 vs 429) | `sum by(status) (rate(query_gateway_requests_total{path="/v1/query"}[2m]))` |
+| Cache hit rate per connector | `rate(query_cache_hits_total[2m])` |

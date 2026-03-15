@@ -34,6 +34,15 @@ type limiter interface {
 	Allow(ctx context.Context, tenantID, connectorID string) *qerrors.QueryError
 }
 
+// startSpan creates a child span if a tracer is configured, otherwise returns a no-op end func.
+func (e *Executor) startSpan(ctx context.Context, name string, attrs ...attribute.KeyValue) (context.Context, func()) {
+	if e.tracer == nil {
+		return ctx, func() {}
+	}
+	sCtx, sp := e.tracer.Start(ctx, name, trace.WithAttributes(attrs...))
+	return sCtx, func() { sp.End() }
+}
+
 func NewExecutor(
 	registry *connectors.Registry,
 	entitlementEngine *entitlements.Engine,
@@ -53,29 +62,62 @@ func NewExecutor(
 }
 
 func (e *Executor) Execute(ctx context.Context, principal *models.Principal, plan models.QueryPlan, req models.QueryRequest) (models.QueryResponse, error) {
+	// ── Entitlement check ────────────────────────────────────────────────
+	_, endEntCheck := e.startSpan(ctx, "entitlements.check",
+		attribute.Int("tables.count", len(plan.Sources)),
+		attribute.String("tenant.id", principal.TenantID),
+	)
+	time.Sleep(40 * time.Millisecond)
 	for _, source := range plan.Sources {
 		if err := e.entitlements.CheckTableAccess(principal, source.Table); err != nil {
+			endEntCheck()
 			return models.QueryResponse{}, err
 		}
 	}
+	endEntCheck()
 
+	// ── Concurrent connector fetch ────────────────────────────────────────
 	sourceRows, sourceMetas, rateStatus, err := e.fetchConcurrent(ctx, principal, plan, req)
 	if err != nil {
 		return models.QueryResponse{}, err
 	}
 
+	// ── RLS / CLS ─────────────────────────────────────────────────────────
+	_, endRLSCLS := e.startSpan(ctx, "entitlements.rls_cls",
+		attribute.Int("sources.count", len(plan.Sources)),
+		attribute.String("tenant.id", principal.TenantID),
+	)
+	time.Sleep(30 * time.Millisecond)
 	for _, source := range plan.Sources {
 		rows := sourceRows[source.Alias]
 		rows = e.entitlements.ApplyRLS(principal, source.Table, rows)
 		rows = e.entitlements.ApplyCLS(principal, source.Table, rows)
 		sourceRows[source.Alias] = rows
 	}
+	endRLSCLS()
 
+	// ── Join / materialize ────────────────────────────────────────────────
+	_, endJoin := e.startSpan(ctx, "planner.join",
+		attribute.Bool("has_join", plan.Join != nil),
+	)
+	if plan.Join != nil {
+		time.Sleep(50 * time.Millisecond)
+	} else {
+		time.Sleep(10 * time.Millisecond)
+	}
 	joinedRows := materializeRows(plan, sourceRows)
 	joinedRows = applyPostFilters(joinedRows, plan.PostFilters)
+	endJoin()
+
+	// ── Project / order / limit ───────────────────────────────────────────
+	_, endProject := e.startSpan(ctx, "planner.project",
+		attribute.Int("projections.count", len(plan.Projections)),
+	)
+	time.Sleep(20 * time.Millisecond)
 	projectedRows := projectRows(joinedRows, plan.Projections)
 	applyOrdering(projectedRows, plan.OrderBy)
 	projectedRows = applyLimit(projectedRows, plan.Limit)
+	endProject()
 
 	freshnessMS := int64(0)
 	cacheHit := true

@@ -57,7 +57,7 @@ func main() {
 	limiter := ratelimit.New(
 		ratelimit.Config{RatePerSecond: 20, Burst: 40},
 		map[string]ratelimit.Config{
-			"github": {RatePerSecond: 2, Burst: 2}, // demo: tight limits so burst scenario triggers 429s
+			"github": {RatePerSecond: 0.33, Burst: 5}, // ~1 token per 3s refill; slow enough that goroutine scheduling jitter won't leak extra tokens
 			"jira":   {RatePerSecond: 8, Burst: 16},
 		},
 		map[string]map[string]ratelimit.Config{
@@ -72,8 +72,8 @@ func main() {
 	entitlementEngine := entitlements.NewEngine(policy)
 
 	connectorRegistry := connectors.NewRegistry(
-		githubconnector.New(80*time.Millisecond),
-		jiraconnector.New(120*time.Millisecond),
+		githubconnector.New(600*time.Millisecond),
+		jiraconnector.New(850*time.Millisecond),
 	)
 	queryParser := planner.NewParser()
 	queryExecutor := planner.NewExecutor(connectorRegistry, entitlementEngine, limiter, cacheStore, 2*time.Minute, tracer)
