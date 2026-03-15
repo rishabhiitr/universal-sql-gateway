@@ -265,7 +265,7 @@ WHERE gh.state = 'open'
 LIMIT 10
 ```
 
-User: Alice (tenant: acme-corp, role: developer). JWT scopes: `github:read`, `jira:read`. Request carries `max_staleness: 300s`.
+User: Alice (tenant: acme-corp, role: developer). Request carries `max_staleness: 300s`. Connector credentials (GitHub API key, Jira OAuth service account) are stored in Vault, separate from Alice's JWT.
 
 ---
 

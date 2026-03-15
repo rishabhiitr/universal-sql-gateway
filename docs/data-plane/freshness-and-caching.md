@@ -20,15 +20,16 @@ The goal is simple: **minimize live SaaS API calls while bounding how stale the 
 
 ## 2. When to Cache
 
-Every connector fetch is cached. There is no opt-out at the fetch level — the question is only *how long* the cached data is considered valid.
+Every connector fetch is always cached. The question is never "should we cache?" — it's "how long is the cached data valid?"
 
-The caching decision is not "should we cache this?" but "how fresh does the caller need it?" That decision is driven by:
+Two inputs control that decision:
 
-- **Connector-configured TTLs** (soft and hard, per connector)
-- **Per-query `max_staleness` hints** from the caller
-- **Rate-limit budget availability** at the time of the request
+- **Connector-configured TTLs** (soft and hard, per connector) — the source's freshness contract
+- **Per-query `max_staleness` hints** from the caller — the consumer's freshness tolerance
 
-The flow: **serve the query from cache if possible, then revalidate asynchronously if the soft TTL has expired.** The user never waits for revalidation unless the hard TTL has also expired. Details in [§4 — How We Cache](#4-how-we-cache).
+The only exception: a connector can be configured with `always_fresh: true`, which forces every request to bypass cache and fetch live from the source. This exists for sources where staleness is unacceptable (e.g., a payments API where amounts must be real-time). It's an admin-level connector config, not a per-query knob.
+
+The default flow: **serve from cache if within TTL, revalidate asynchronously if the soft TTL has expired.** The caller never waits for revalidation unless the hard TTL has also expired. Details in [§4 — How We Cache](#4-how-we-cache).
 
 ---
 
